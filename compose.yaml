@@ -1,0 +1,17 @@
+services:
+  maintainerr-telegram-polls:
+    image: python:3.13-alpine
+    container_name: maintainerr-telegram-polls
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "-u", "bot.py"]
+    env_file: .env
+    volumes:
+      - ./:/app
+    networks:
+      - maintainerr_network
+
+networks:
+  maintainerr_network:
+    external: true
+    name: ${MAINTAINERR_NETWORK:-compose_default}

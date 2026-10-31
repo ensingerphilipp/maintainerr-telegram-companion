@@ -1,0 +1,38 @@
+# Runtime secrets (never publish)
+.env
+.env.*
+!.env.example
+*.secret
+*.pem
+*.key
+credentials*
+secrets*
+
+# Runtime state, logs, and local backups
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.bak
+*.bak.*
+*.lock
+*.log
+*.json.backup
+cleanup_results.json
+poll_history*
+backups/
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
