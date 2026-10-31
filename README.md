@@ -7,7 +7,7 @@ An independent, self-hosted voting companion for [Maintainerr](https://github.co
 **One veto saves a title.** Otherwise, a postponement vote gives it another 60 days. If nobody votes to protect it, Maintainerr can continue its own cleanup process.
 
 > [!IMPORTANT]
-> **This bot never deletes media.** Maintainerr handles deletion according to its own settings and schedule. The companion **does** reset Maintainerr retention timers when polls are created and add/remove exclusions based on votes. Read [Deletion safety](#deletion-safety-and-limitations) before enabling automatic deletion in Maintainerr.
+> **Set each Maintainerr rule/collection's “Delete after days” delay to a value GREATER than the poll closing duration.** For example: **29-day poll → 45-day deletion delay**. Otherwise Maintainerr may delete a title before Telegram voting finishes. The bot never deletes media itself, but it resets Maintainerr timers and manages exclusions. See [Deletion safety](#deletion-safety-and-limitations).
 
 ## At a glance
 
@@ -110,7 +110,7 @@ With `PUBLISH_POLLS=false`, the companion does not create **new** polls. It can 
 
 **3. Enable publication when ready**
 
-Check the collection IDs, Maintainerr retention settings, Telegram permissions, and [deletion safety](#deletion-safety-and-limitations). Then set `PUBLISH_POLLS=true` in `.env` and recreate the container:
+**Before enabling publication or deletion, configure every watched Maintainerr rule/collection so its “Delete after days” delay is strictly longer than `POLL_DAYS`.** With the example values, set Maintainerr to **45 days** and `POLL_DAYS=29` (a nominal **16-day buffer**). Set `RETENTION_DAYS=45` to match Maintainerr. Check collection IDs, Telegram permissions, and [deletion safety](#deletion-safety-and-limitations). Then set `PUBLISH_POLLS=true` in `.env` and recreate the container:
 
 ```bash
 docker compose up -d --force-recreate
@@ -134,7 +134,7 @@ The bot runs a reconciliation cycle immediately at startup, then periodically. I
 | `POLL_DAYS` | `29` | Normal minimum poll age before closing |
 | `RETENTION_DAYS` | `45` | Expected Maintainerr deletion timer |
 
-`POLL_DAYS` must be at least 1 and less than `RETENTION_DAYS`. Set the corresponding retention period in Maintainerr itself: the bot **checks** the collection settings but does not configure the collection deletion action or retention period.
+**Required timing:** `POLL_DAYS` must be at least 1 and strictly less than `RETENTION_DAYS`. Set Maintainerr's **“Delete after days”** value for each watched rule/collection to match `RETENTION_DAYS` and to occur **after** the poll closes. The bot checks these settings but does not configure the deletion action or retention period. Leave additional time for reconciliation, service outages, and operational delays; the 16-day buffer in the 29/45 example is not a guarantee.
 
 ## Close polls early
 
@@ -160,7 +160,7 @@ docker compose run --rm -T maintainerr-telegram-polls python close_polls.py --da
 ## Deletion safety and limitations
 
 > [!WARNING]
-> **Maintainerr's deletion timer is independent of Telegram voting.** If the companion is offline long enough, Maintainerr may delete media before the companion processes a veto. This project does not provide a fail-safe ordering mechanism or distributed transaction. Test your deployment thoroughly before enabling real deletion in Maintainerr.
+> **Maintainerr deletion must happen AFTER poll closure.** For each watched rule or collection, set “Delete after days” greater than `POLL_DAYS`. For example, a 29-day poll and a 45-day deletion delay provide a nominal 16-day buffer. The deletion timer runs independently of voting: extended downtime can still result in deletion before a veto is processed. There is no fail-safe ordering or distributed transaction. Test thoroughly before enabling deletion.
 
 - **Retention reset:** When publishing a poll, the companion calls Maintainerr's postpone endpoint to reset that title's deletion timer. Configure the same retention interval in Maintainerr and `RETENTION_DAYS`.
 - **No automatic deletion:** The companion never calls a media-delete endpoint and never changes the collection's deletion action. With no protection votes, the outcome is simply *no new exclusion*.
