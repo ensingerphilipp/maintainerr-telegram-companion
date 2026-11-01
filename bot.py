@@ -41,10 +41,24 @@ def api(url, body=None, method=None):
         if not r.status in range(200,300):raise RuntimeError(str(result))
         return result
 def maintain(path,body=None,method=None):return api(BASE+path,body,method)
-def telegram(method,body):return api("https://api.telegram.org/bot"+TOKEN+"/"+method,body)
+class TelegramAPIError(RuntimeError):
+    def __init__(self, method, code, description):
+        self.code = code
+        self.description = str(description).replace(TOKEN, "[redacted]") if TOKEN else str(description)
+        super().__init__(f"Telegram {method}: HTTP {code}: {self.description}")
+
+def telegram(method,body):
+    try:
+        return api("https://api.telegram.org/bot"+TOKEN+"/"+method,body)
+    except urllib.error.HTTPError as exc:
+        try:
+            description = json.loads(exc.read()).get("description", "No description")
+        except (ValueError, UnicodeError, AttributeError):
+            description = "Unreadable HTTP error response"
+        raise TelegramAPIError(method, exc.code, description) from None
 def tg(method,body):
     r=telegram(method,body)
-    if not r.get("ok"):raise RuntimeError("Telegram "+method+": "+str(r.get("description")))
+    if not r.get("ok"):raise TelegramAPIError(method,r.get("error_code"),r.get("description"))
     return r["result"]
 def database():
     c=sqlite3.connect(DB)
@@ -58,6 +72,9 @@ def database():
     c.commit()
     voting.migrate(c)
     covers.migrate(c)
+    c.execute("""CREATE TABLE IF NOT EXISTS closed_poll_results(
+        poll_id TEXT PRIMARY KEY, payload TEXT NOT NULL, recorded_at TEXT NOT NULL)""")
+    c.commit()
     return c
 def members(cid):
     page=1;result=[]
@@ -112,18 +129,69 @@ def reset_timer(c,cid,media_id,title):
     c.execute("UPDATE polls SET state='open' WHERE collection_id=? AND media_id=?",(cid,media_id))
     c.commit()
 
+def recover_closed_poll(rec):
+    # Telegram has no getMessage endpoint. Editing our own poll's inline markup
+    # returns the Message, including its current Poll; restore the empty markup.
+    # All companion polls are published without an inline keyboard.
+    msg, poll_id = rec[3], rec[4]
+    try:
+        message = tg("editMessageReplyMarkup", {
+            "chat_id": CHAT, "message_id": msg,
+            "reply_markup": {"inline_keyboard": [[{
+                "text": "🗳️", "callback_data": f"companion:recover:{time.time_ns()}"
+            }]]}})
+    finally:
+        try:
+            tg("editMessageReplyMarkup", {
+                "chat_id": CHAT, "message_id": msg,
+                "reply_markup": {"inline_keyboard": []}})
+        except Exception as exc:
+            logging.warning("Could not restore poll markup for message %s: %s", msg, exc)
+    result = message.get("poll", {})
+    if result.get("id") != poll_id or result.get("is_closed") is not True:
+        raise RuntimeError(f"Cannot recover {rec[2]}: matching closed poll not confirmed")
+    logging.info("Recovered already-closed poll for %s", rec[2])
+    return result
+
+def final_poll(c, rec):
+    cached = c.execute("SELECT payload,recorded_at FROM closed_poll_results WHERE poll_id=?",
+                       (rec[4],)).fetchone()
+    if cached:
+        result, closed_at = json.loads(cached[0]), parse(cached[1])
+    else:
+        try:
+            result = tg("stopPoll", {"chat_id": CHAT, "message_id": rec[3]})
+        except TelegramAPIError as exc:
+            reason = exc.description.lower().removeprefix("bad request: ")
+            if exc.code != 400 or reason not in (
+                    "poll can't be stopped", "poll has already been closed"):
+                raise
+            result = recover_closed_poll(rec)
+        closed_at = now()
+    if result.get("id") != rec[4] or result.get("is_closed") is not True:
+        raise RuntimeError(f"Final poll identity or closed state not confirmed: {rec[2]}")
+    options = result.get("options", [])
+    if len(options) not in (2, 3) or any(
+            type(o.get("voter_count")) is not int or o["voter_count"] < 0 for o in options):
+        raise RuntimeError("Unexpected poll choices or counts: " + rec[2])
+    if not cached:
+        # Persist before applying votes so a retry never needs to stop it again.
+        c.execute("INSERT INTO closed_poll_results VALUES (?,?,?)",
+                  (rec[4], json.dumps(result), iso(closed_at)))
+        c.commit()
+    return result, closed_at
+
 def close_due(c,rec,min_age_days=POLL_DAYS):
     cid,media_id,title,msg,_,opened,_,_,_,state=rec[:10]
     if min_age_days < 0:
         raise ValueError("min_age_days must be nonnegative")
     if state!="open" or now()<parse(opened)+timedelta(days=min_age_days):return
-    result=tg("stopPoll",{"chat_id":CHAT,"message_id":msg})
-    options=result.get("options",[])
-    if len(options) not in (2,3):raise RuntimeError("Unexpected poll choices: "+title)
+    result, closed_at = final_poll(c, rec)
+    options = result["options"]
     kept=int(options[0]["voter_count"])
     snooze=int(options[1]["voter_count"]) if len(options)==3 else 0
     deleted=int(options[-1]["voter_count"])
-    outcome=voting.save_votes(c,rec,kept,snooze,deleted,now,iso)
+    outcome=voting.save_votes(c,rec,kept,snooze,deleted,lambda: closed_at,iso)
     logging.info("Closed %s: veto=%d snooze=%d okay=%d => %s",title,kept,snooze,deleted,outcome)
     if kept:voting.permanent_veto(c,rec,maintain)
     elif snooze:voting.start_snooze(c,rec,maintain)

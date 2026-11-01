@@ -157,6 +157,14 @@ docker compose run --rm -T maintainerr-telegram-polls python close_polls.py --da
 - The 60-day postponement period begins when the poll **actually closes**, including an early close.
 - Closing a poll changes Telegram and Maintainerr state; it does **not** delete media directly.
 
+### Recovery of already-closed polls
+
+If Telegram reports that a poll cannot be stopped or is already closed, the companion checks the original message and accepts results only when its poll ID matches the database and Telegram confirms it is closed. It never interprets a failed request as zero votes. Deleted, inaccessible, mismatched, or still-open polls remain errors for manual investigation.
+
+Telegram has no general Bot API method to fetch an existing group message. Recovery briefly adds a 🗳️ inline button to the companion's poll and removes it immediately; the edit response supplies the current poll and final counts. Companion polls have no inline keyboard normally. If removal fails, a warning identifies the message; its verified voting result is still processed.
+
+Final results are saved in SQLite before applying votes, so retries reuse those results without stopping the poll again. For recovered polls whose original closing time is unavailable, the 60-day postponement starts when the final results are first recovered. A recovery does not change the normal closing schedule.
+
 ## Deletion safety and limitations
 
 > [!WARNING]
