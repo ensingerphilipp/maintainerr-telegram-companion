@@ -165,6 +165,22 @@ Telegram has no general Bot API method to fetch an existing group message. Recov
 
 Final results are saved in SQLite before applying votes, so retries reuse those results without stopping the poll again. For recovered polls whose original closing time is unavailable, the 60-day postponement starts when the final results are first recovered. A recovery does not change the normal closing schedule.
 
+### Telegram rate limits
+
+Both the scheduled bot and manual CLI use the same Telegram request handler. On HTTP 429 or a JSON response with error code 429, it waits for Telegram's `parameters.retry_after` seconds plus a one-second buffer, then retries the identical request. Without a valid retry delay it uses exponential backoff (5, 10, 20, 40, then 60 seconds). Each request permits five retries; exhaustion leaves its error visible and an unprocessed poll available for a later attempt. Long waits are logged and split into at most 60-second sleeps.
+
+Ambiguous network timeouts are not blindly retried: a timed-out `sendPoll` or `sendPhoto` may already have succeeded. A later poll-close retry can recover an already-closed poll using the verified recovery described above.
+
+### When Telegram considers a poll closed
+
+Telegram's `Poll.is_closed` flag means the poll no longer accepts votes. An HTTP 400 response alone does not establish that state; recovery checks the actual poll object.
+
+Telegram can automatically close a poll if its creator specifies `open_period` or `close_date`. It can also be explicitly stopped through an authorized UI/API action, and the Bot API can create an immediately closed preview using `is_closed=true`. The companion sets none of those creation parameters: `POLL_DAYS` is its own scheduling threshold, followed by a `stopPoll` request.
+
+The companion has no vote-count or all-members-voted closing rule. Telegram's documented automatic closing controls are the optional duration/deadline parameters; a greyed-out voting UI for an individual user is not sufficient evidence of a globally closed poll. The Bot API poll object has no field identifying who stopped a poll or the actual time of an unscheduled closure, so recovered counts alone cannot establish its historical cause.
+
+References: [Telegram Poll](https://core.telegram.org/bots/api#poll), [sendPoll](https://core.telegram.org/bots/api#sendpoll), [stopPoll](https://core.telegram.org/bots/api#stoppoll), [Telegram poll protocol](https://core.telegram.org/api/poll).
+
 ## Deletion safety and limitations
 
 > [!WARNING]

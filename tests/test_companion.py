@@ -205,6 +205,83 @@ class PollTests(unittest.TestCase):
             bot.close_due(self.db, rec, min_age_days=0)
         self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "released")
 
+    def test_http_429_keeps_retry_after_parameters(self):
+        import io
+        import urllib.error
+        error = urllib.error.HTTPError(
+            "https://example.invalid", 429, "Too Many Requests", {},
+            io.BytesIO(b'{"description":"Too Many Requests","parameters":{"retry_after":17}}'))
+        with patch.object(bot, "api", side_effect=error):
+            with self.assertRaises(bot.TelegramAPIError) as caught:
+                bot.telegram("stopPoll", {})
+        self.assertEqual(caught.exception.retry_after, 17)
+
+    def test_429_response_waits_then_repeats_identical_request(self):
+        body = {"chat_id": "chat", "message_id": 123}
+        responses = [
+            {"ok": False, "error_code": 429, "description": "Too Many Requests",
+             "parameters": {"retry_after": 12}},
+            {"ok": True, "result": {"done": True}},
+        ]
+        with patch.object(bot, "telegram", side_effect=responses) as telegram, \
+             patch.object(bot.time, "sleep") as sleep:
+            self.assertEqual(bot.tg("stopPoll", body), {"done": True})
+        sleep.assert_called_once_with(13)
+        self.assertEqual(telegram.call_args_list, [
+            unittest.mock.call("stopPoll", body), unittest.mock.call("stopPoll", body)])
+
+    def test_http_429_wait_is_not_shortened_and_long_wait_is_chunked(self):
+        error = bot.TelegramAPIError("stopPoll", 429, "rate limited", {"retry_after": 125})
+        with patch.object(bot, "telegram", side_effect=[error, {"ok": True, "result": True}]), \
+             patch.object(bot.time, "sleep") as sleep:
+            self.assertTrue(bot.tg("stopPoll", {}))
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [60, 60, 6])
+
+    def test_repeated_429_uses_bounded_backoff_without_losing_open_state(self):
+        rec = self.insert("1")
+        error = bot.TelegramAPIError("stopPoll", 429, "rate limited")
+        with patch.object(bot, "telegram", side_effect=error) as telegram, \
+             patch.object(bot.time, "sleep") as sleep:
+            with self.assertRaises(bot.TelegramAPIError):
+                bot.close_due(self.db, rec, min_age_days=0)
+        self.assertEqual(telegram.call_count, 6)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [5, 10, 20, 40, 60])
+        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "open")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM closed_poll_results").fetchone()[0], 0)
+
+    def test_non_429_and_network_timeouts_are_not_retried(self):
+        for error in (bot.TelegramAPIError("sendPoll", 400, "bad request"), TimeoutError()):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(bot, "telegram", side_effect=error) as telegram, \
+                     patch.object(bot.time, "sleep") as sleep:
+                    with self.assertRaises(type(error)):
+                        bot.tg("sendPoll", {})
+                telegram.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_scheduler_closure_succeeds_after_429(self):
+        rec = self.insert("1", days_old=30)
+        error = bot.TelegramAPIError("stopPoll", 429, "rate limited", {"retry_after": 1})
+        with patch.object(bot, "telegram", side_effect=[
+                error, {"ok": True, "result": self.closed_poll()}]), \
+             patch.object(bot.time, "sleep"):
+            bot.close_due(self.db, rec)
+        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "released")
+
+    def test_manual_cli_succeeds_after_429(self):
+        from contextlib import nullcontext, redirect_stdout
+        import io
+        self.insert("1")
+        error = bot.TelegramAPIError("stopPoll", 429, "rate limited", {"retry_after": 1})
+        with patch.object(bot, "telegram", side_effect=[
+                error, {"ok": True, "result": self.closed_poll()}]), \
+             patch.object(bot.time, "sleep"), \
+             patch.object(bot, "TOKEN", "test-token"), patch.object(bot, "CHAT", "test-chat"), \
+             patch.object(bot, "execution_lock", return_value=nullcontext()), \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(close_polls.main(["--days", "0", "--execute"]), 0)
+        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "released")
+
     def test_cover_url_is_strict(self):
         self.assertEqual(
             covers.poster_url({"image_path": "https://image.tmdb.org/t/p/w500/abc.jpg"}),

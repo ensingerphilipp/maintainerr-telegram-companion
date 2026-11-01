@@ -42,8 +42,11 @@ def api(url, body=None, method=None):
         return result
 def maintain(path,body=None,method=None):return api(BASE+path,body,method)
 class TelegramAPIError(RuntimeError):
-    def __init__(self, method, code, description):
+    def __init__(self, method, code, description, parameters=None):
         self.code = code
+        self.parameters = parameters if isinstance(parameters, dict) else {}
+        retry_after = self.parameters.get("retry_after")
+        self.retry_after = retry_after if type(retry_after) is int and retry_after >= 0 else None
         self.description = str(description).replace(TOKEN, "[redacted]") if TOKEN else str(description)
         super().__init__(f"Telegram {method}: HTTP {code}: {self.description}")
 
@@ -52,14 +55,38 @@ def telegram(method,body):
         return api("https://api.telegram.org/bot"+TOKEN+"/"+method,body)
     except urllib.error.HTTPError as exc:
         try:
-            description = json.loads(exc.read()).get("description", "No description")
+            response = json.loads(exc.read())
+            description = response.get("description", "No description")
+            parameters = response.get("parameters")
         except (ValueError, UnicodeError, AttributeError):
-            description = "Unreadable HTTP error response"
-        raise TelegramAPIError(method, exc.code, description) from None
+            description, parameters = "Unreadable HTTP error response", None
+        finally:
+            exc.close()
+        raise TelegramAPIError(method, exc.code, description, parameters) from None
+
+TELEGRAM_MAX_RETRIES = 5
+
 def tg(method,body):
-    r=telegram(method,body)
-    if not r.get("ok"):raise TelegramAPIError(method,r.get("error_code"),r.get("description"))
-    return r["result"]
+    for attempt in range(TELEGRAM_MAX_RETRIES + 1):
+        try:
+            r = telegram(method, body)
+            if not r.get("ok"):
+                raise TelegramAPIError(method, r.get("error_code"),
+                                       r.get("description"), r.get("parameters"))
+            return r["result"]
+        except TelegramAPIError as exc:
+            if exc.code != 429 or attempt == TELEGRAM_MAX_RETRIES:
+                raise
+            # Flood control means Telegram rejected this request, so retrying
+            # the identical operation is safe. Do not retry ambiguous network
+            # timeouts here: sendPoll/sendPhoto could otherwise be duplicated.
+            delay = exc.retry_after + 1 if exc.retry_after is not None else min(5 * 2**attempt, 60)
+            logging.warning("Telegram %s rate limited; retry %s/%s in %ss",
+                            method, attempt + 1, TELEGRAM_MAX_RETRIES, delay)
+            while delay > 0:
+                chunk = min(delay, 60)
+                time.sleep(chunk)
+                delay -= chunk
 def database():
     c=sqlite3.connect(DB)
     c.execute("PRAGMA journal_mode=WAL")
