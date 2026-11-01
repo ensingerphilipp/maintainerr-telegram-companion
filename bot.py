@@ -103,10 +103,55 @@ def telegram(method,body):
 
 TELEGRAM_MAX_RETRIES = 5
 
+TELEGRAM_CHAT_INTERVAL = 3.2
+TELEGRAM_MUTATIONS = {"sendMessage", "sendPhoto", "sendPoll", "stopPoll",
+                      "editMessageReplyMarkup", "deleteMessage"}
+
+def pace_telegram(method, body):
+    rate = sqlite3.connect(DB, timeout=30)
+    try:
+        rate.execute("BEGIN IMMEDIATE")
+        rate.execute("""CREATE TABLE IF NOT EXISTS telegram_rate_limits(
+            scope TEXT PRIMARY KEY,next_allowed REAL NOT NULL)""")
+        current = time.time()
+        global_row = rate.execute("SELECT next_allowed FROM telegram_rate_limits WHERE scope='global'").fetchone()
+        ready = max(current, global_row[0] if global_row else current)
+        if method in TELEGRAM_MUTATIONS and "chat_id" in body:
+            scope = "chat:" + str(body["chat_id"])
+            chat_row = rate.execute("SELECT next_allowed FROM telegram_rate_limits WHERE scope=?", (scope,)).fetchone()
+            ready = max(ready, chat_row[0] if chat_row else current)
+            rate.execute("INSERT OR REPLACE INTO telegram_rate_limits VALUES (?,?)",
+                         (scope, ready + TELEGRAM_CHAT_INTERVAL))
+        rate.commit()
+    finally:
+        rate.close()
+    delay = max(0, ready - current)
+    if delay:
+        logging.debug("event=telegram_paced method=%s target=%s delay=%.3f",
+                      method, telegram_target(body), delay)
+    while delay > 0:
+        chunk = min(delay, 60)
+        time.sleep(chunk)
+        delay -= chunk
+
+def record_telegram_cooldown(delay):
+    rate = sqlite3.connect(DB, timeout=30)
+    try:
+        with rate:
+            rate.execute("""CREATE TABLE IF NOT EXISTS telegram_rate_limits(
+                scope TEXT PRIMARY KEY,next_allowed REAL NOT NULL)""")
+            rate.execute("""INSERT INTO telegram_rate_limits VALUES ('global',?)
+                ON CONFLICT(scope) DO UPDATE SET
+                next_allowed=MAX(telegram_rate_limits.next_allowed,excluded.next_allowed)""",
+                (time.time() + delay,))
+    finally:
+        rate.close()
+
 def tg(method,body):
     request_id = f"{time.time_ns():x}"
     target = telegram_target(body)
     for attempt in range(TELEGRAM_MAX_RETRIES + 1):
+        pace_telegram(method, body)
         started = time.monotonic()
         try:
             r = telegram(method, body)
@@ -132,9 +177,12 @@ def tg(method,body):
                         (time.monotonic() - started) * 1000, exc.http_status, exc.api_code,
                         exc.description, diagnostic_json(exc.parameters), exc.retry_after,
                         delay, retry, exc.headers_text, exc.response_text)
+            if exc.code == 429:
+                cooldown = exc.retry_after + 1 if exc.retry_after is not None else min(5 * 2**attempt, 60)
+                record_telegram_cooldown(cooldown)
             if not retry:
                 raise
-            # No outcomes follow an ambiguous cached 400 after a rate limit.
+            # Persist flood waits for the next process as well as this retry.
             while delay > 0:
                 chunk = min(delay, 60)
                 time.sleep(chunk)
@@ -160,31 +208,40 @@ def database():
     c.commit()
     voting.migrate(c)
     covers.migrate(c)
-    c.execute("""CREATE TABLE IF NOT EXISTS closed_poll_results(
-        poll_id TEXT PRIMARY KEY, payload TEXT NOT NULL, recorded_at TEXT NOT NULL,
-        source TEXT NOT NULL DEFAULT 'unverified')""")
-    fields = {r[1] for r in c.execute("PRAGMA table_info(closed_poll_results)")}
-    if "source" not in fields:
-        c.execute("ALTER TABLE closed_poll_results ADD COLUMN source TEXT NOT NULL DEFAULT 'unverified'")
-    c.execute("""CREATE TABLE IF NOT EXISTS poll_closure_reviews(
-        poll_id TEXT PRIMARY KEY, prior_state TEXT NOT NULL,
-        reason TEXT NOT NULL, marked_at TEXT NOT NULL)""")
-    # Older versions accepted a cached closed flag without a successful stop.
-    # Preserve snapshots, votes, and exclusion ownership, but freeze processing.
-    c.execute("""INSERT OR IGNORE INTO poll_closure_reviews
-        SELECT p.poll_id,p.state,?,? FROM polls p JOIN closed_poll_results r
-        ON r.poll_id=p.poll_id WHERE r.source!='stopPoll'""",
-        ("Legacy result has no acknowledged stopPoll response", iso(now())))
-    c.execute("""UPDATE polls SET state='closure_unverified' WHERE state!='stale' AND poll_id IN
-        (SELECT poll_id FROM closed_poll_results WHERE source!='stopPoll')""")
     fields = {r[1] for r in c.execute("PRAGMA table_info(polls)")}
-    for name in ("stale_since", "stale_reason", "stale_previous_state"):
+    for name in ("stale_since", "stale_reason", "stale_previous_state", "close_requested_at"):
         if name not in fields:
             c.execute(f"ALTER TABLE polls ADD COLUMN {name} TEXT")
     c.execute("""CREATE TABLE IF NOT EXISTS stale_poll_archive(
         poll_id TEXT PRIMARY KEY, collection_id INTEGER NOT NULL, media_id TEXT NOT NULL,
         title TEXT NOT NULL, payload TEXT NOT NULL, stale_since TEXT NOT NULL,
         reason TEXT NOT NULL, archived_at TEXT NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS final_poll_results(
+        poll_id TEXT PRIMARY KEY,payload TEXT NOT NULL,recorded_at TEXT NOT NULL,
+        proof TEXT NOT NULL CHECK(proof='stopPoll'))""")
+    # Remove the superseded recovery schema. Only acknowledged responses survive.
+    tables = {row[0] for row in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "closed_poll_results" in tables:
+        old_fields = {row[1] for row in c.execute("PRAGMA table_info(closed_poll_results)")}
+        if "source" in old_fields:
+            c.execute("""INSERT OR IGNORE INTO final_poll_results
+                SELECT poll_id,payload,recorded_at,'stopPoll' FROM closed_poll_results
+                WHERE source='stopPoll'""")
+            untrusted = "SELECT poll_id FROM closed_poll_results WHERE source!='stopPoll'"
+        else:
+            untrusted = "SELECT poll_id FROM closed_poll_results"
+        c.execute("""UPDATE polls SET
+            state=CASE WHEN state='closure_unverified' THEN 'open' ELSE state END,
+            closed_at=NULL,keep_votes=NULL,postpone_votes=NULL,delete_votes=NULL,snooze_until=NULL,
+            close_requested_at=COALESCE(close_requested_at,?)
+            WHERE poll_id IN (""" + untrusted + ")", (iso(now()),))
+        c.execute("DROP TABLE closed_poll_results")
+    c.execute("""UPDATE polls SET state='open',closed_at=NULL,keep_votes=NULL,
+        postpone_votes=NULL,delete_votes=NULL,snooze_until=NULL,
+        close_requested_at=COALESCE(close_requested_at,?)
+        WHERE state='closure_unverified'""",(iso(now()),))
+    c.execute("UPDATE polls SET stale_previous_state='open' WHERE stale_previous_state='closure_unverified'")
+    c.execute("DROP TABLE IF EXISTS poll_closure_reviews")
     c.commit()
     return c
 def metadata_exists(media_id):
@@ -321,36 +378,14 @@ def reset_timer(c,cid,media_id,title):
     c.execute("UPDATE polls SET state='open' WHERE collection_id=? AND media_id=?",(cid,media_id))
     c.commit()
 
-class PollClosureUnverified(RuntimeError):
-    pass
-
-def mark_closure_unverified(c, rec, reason):
-    c.execute("INSERT OR IGNORE INTO poll_closure_reviews VALUES (?,?,?,?)",
-              (rec[4], rec[9], reason, iso(now())))
-    c.execute("UPDATE polls SET state='closure_unverified' WHERE collection_id=? AND media_id=?",
-              (rec[0], rec[1]))
-    c.commit()
-
 def final_poll(c, rec):
-    cached = c.execute("SELECT payload,recorded_at,source FROM closed_poll_results WHERE poll_id=?",
+    cached = c.execute("SELECT payload,recorded_at FROM final_poll_results WHERE poll_id=?",
                        (rec[4],)).fetchone()
-    acknowledged = cached is not None and cached[2] == "stopPoll"
+    acknowledged = cached is not None
     if acknowledged:
         result, closed_at = json.loads(cached[0]), parse(cached[1])
     else:
-        try:
-            result = tg("stopPoll", {"chat_id": CHAT, "message_id": rec[3]})
-        except TelegramAPIError as exc:
-            reason = exc.description.lower().removeprefix("bad request: ")
-            if exc.code == 400 and reason in (
-                    "poll can't be stopped", "poll has already been closed"):
-                mark_closure_unverified(c, rec, exc.description)
-                raise PollClosureUnverified(
-                    f"Closure unverified for {rec[2]}: no successful stopPoll response. "
-                    f"Telegram reason: {exc.description}. "
-                    "Telegram's cached closed flag cannot confirm closure; no outcome applied."
-                ) from None
-            raise
+        result = tg("stopPoll", {"chat_id": CHAT, "message_id": rec[3]})
         closed_at = now()
     if result.get("id") != rec[4] or result.get("is_closed") is not True:
         raise RuntimeError(f"Final poll identity or closed state not confirmed: {rec[2]}")
@@ -360,9 +395,9 @@ def final_poll(c, rec):
         raise RuntimeError("Unexpected poll choices or counts: " + rec[2])
     if not acknowledged:
         # Only an acknowledged stop, never a message edit, can produce this cache.
-        c.execute("""INSERT INTO closed_poll_results(poll_id,payload,recorded_at,source)
+        c.execute("""INSERT INTO final_poll_results(poll_id,payload,recorded_at,proof)
             VALUES (?,?,?,'stopPoll') ON CONFLICT(poll_id) DO UPDATE SET
-            payload=excluded.payload,recorded_at=excluded.recorded_at,source=excluded.source""",
+            payload=excluded.payload,recorded_at=excluded.recorded_at,proof=excluded.proof""",
             (rec[4], json.dumps(result), iso(closed_at)))
         c.commit()
     logging.info("event=poll_close_result collection_id=%s media_id=%s poll_id=%s "
@@ -371,37 +406,38 @@ def final_poll(c, rec):
                  result.get("is_closed"), [o["voter_count"] for o in options], iso(closed_at))
     return result, closed_at
 
-def close_due(c,rec,min_age_days=POLL_DAYS,*,retry_unverified=False,metadata_checked=False):
+def close_due(c,rec,min_age_days=POLL_DAYS,*,metadata_checked=False):
     cid,media_id,title,msg,_,opened,_,_,_,state=rec[:10]
     if min_age_days < 0:
         raise ValueError("min_age_days must be nonnegative")
-    eligible_state = state == "open" or (retry_unverified and state == "closure_unverified")
-    if not eligible_state or now()<parse(opened)+timedelta(days=min_age_days):return
+    requested = c.execute("SELECT close_requested_at FROM polls WHERE collection_id=? AND media_id=?",
+                          (cid,media_id)).fetchone()[0]
+    if state != "open" or (not requested and now()<parse(opened)+timedelta(days=min_age_days)):
+        return
     if not metadata_checked and reconcile_poll_metadata(c,rec) is None:
         return
     logging.info("event=poll_close_attempt title=%r collection_id=%s media_id=%s "
                  "poll_id=%s chat_id=%s message_id=%s state=%s opened_at=%s min_age_days=%s",
                  title, cid, media_id, rec[4], redact_diagnostic(CHAT), msg, state,
                  opened, min_age_days)
+    c.execute("UPDATE polls SET close_requested_at=COALESCE(close_requested_at,?) "
+              "WHERE collection_id=? AND media_id=?",(iso(now()),cid,media_id))
+    c.commit()
     result, closed_at = final_poll(c, rec)
     options = result["options"]
     kept=int(options[0]["voter_count"])
     snooze=int(options[1]["voter_count"]) if len(options)==3 else 0
     deleted=int(options[-1]["voter_count"])
     outcome=voting.save_votes(c,rec,kept,snooze,deleted,lambda: closed_at,iso)
+    c.execute("UPDATE polls SET close_requested_at=NULL WHERE collection_id=? AND media_id=?",
+              (cid,media_id))
+    c.commit()
     logging.info("Closed %s: veto=%d snooze=%d okay=%d => %s",title,kept,snooze,deleted,outcome)
     try:
         if kept:voting.permanent_veto(c,rec,maintain)
         elif snooze:voting.start_snooze(c,rec,maintain)
     except voting.MissingMetadataError as exc:
         mark_stale(c,rec,str(exc))
-def exclude(c,cid,media_id,title):
-    response=maintain("/api/rules/exclusions/bulk",{"collectionId":cid,"mediaIds":[media_id],"action":0})
-    if not response.get("results") or any(x.get("code")!=1 for x in response["results"]):
-        raise RuntimeError("Maintainerr exclusion not confirmed: "+str(response))
-    c.execute("UPDATE polls SET state='vetoed' WHERE collection_id=? AND media_id=?",(cid,media_id))
-    c.commit()
-    logging.info("VETO protected %s",title)
 def sync():
     if not TOKEN or not CHAT:
         logging.warning("Telegram credentials missing; not attempting polling")
@@ -410,9 +446,6 @@ def sync():
     collections=check_collections()
     metadata_failures=refresh_poll_metadata(c)
     existing={(r[0],r[1]):r for r in c.execute("SELECT * FROM polls").fetchall()}
-    held = sum(rec[9] == "closure_unverified" for rec in existing.values())
-    if held:
-        logging.warning("%s poll outcomes held for closure review; existing protections retained", held)
     # Always reconcile historical results, even for media no longer in a collection.
     for rec in existing.values():
         if (rec[0],rec[1]) in metadata_failures:

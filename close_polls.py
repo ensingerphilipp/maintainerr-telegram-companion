@@ -6,17 +6,14 @@ import sys
 from datetime import timedelta
 import bot
 
-def eligible(rows, days, timestamp, include_unverified=False):
+def eligible(rows, days, timestamp):
     cutoff=timestamp-timedelta(days=days)
-    states = {"open", "closure_unverified"} if include_unverified else {"open"}
-    return [r for r in rows if r[9] in states and bot.parse(r[5])<=cutoff]
+    return [r for r in rows if r[9]=="open" and bot.parse(r[5])<=cutoff]
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description="Close and evaluate polls after a configurable minimum age.")
     parser.add_argument("--days",type=float,required=True,help="Minimum poll age in days, e.g. 3 (0 means all open polls)")
     parser.add_argument("--execute",action="store_true",help="Actually stop and evaluate matching polls; otherwise preview only")
-    parser.add_argument("--retry-unverified", action="store_true",
-                        help="Also attempt a real stop for polls held for closure review; may close live polls")
     args=parser.parse_args(argv)
     if not 0<=args.days<=bot.POLL_DAYS:
         parser.error(f"--days must be between 0 and {bot.POLL_DAYS}")
@@ -33,10 +30,7 @@ def main(argv=None):
             archived_count=initial_count-len(records)
             if stale_count or archived_count:
                 print(f"Stale metadata: {stale_count} ignored, {archived_count} archived.",flush=True)
-            held = sum(row[9] == "closure_unverified" for row in records)
-            if held:
-                print(f"Closure review: {held} unverified polls. A real close retry requires --retry-unverified --execute.",flush=True)
-            matches=eligible(records,args.days,bot.now(),include_unverified=args.retry_unverified)
+            matches=eligible(records,args.days,bot.now())
             print(f"{'EXECUTE' if args.execute else 'PREVIEW'}: {len(matches)} eligible polls at least {args.days:g} days old",flush=True)
             for row in matches:
                 age=(bot.now()-bot.parse(row[5])).total_seconds()/86400
@@ -51,8 +45,7 @@ def main(argv=None):
                 if (row[0],row[1]) in metadata_failures:
                     continue
                 try:
-                    bot.close_due(db,row,min_age_days=args.days,retry_unverified=args.retry_unverified,
-                                  metadata_checked=True)
+                    bot.close_due(db,row,min_age_days=args.days,metadata_checked=True)
                     found=db.execute("SELECT state FROM polls WHERE collection_id=? AND media_id=?",
                                      (row[0],row[1])).fetchone()
                     status=found[0] if found else "archived_stale"

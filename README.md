@@ -157,29 +157,21 @@ docker compose run --rm -T maintainerr-telegram-polls python close_polls.py --da
 - The 60-day postponement period begins when the poll **actually closes**, including an early close.
 - Closing a poll changes Telegram and Maintainerr state; it does **not** delete media directly.
 
-### Acknowledged closure and review holds
+### Reliable closing and automatic retries
 
-Only a successful `stopPoll` response can authorize a final voting outcome. The companion validates the poll ID, closed state, and vote counts, then saves that response with `source=stopPoll` before applying votes. A retry can reuse that acknowledged result if a later database or Maintainerr step fails.
+Chat-changing Telegram calls are paced at least **3.2 seconds apart per chat**, with the pacing state saved in SQLite so the scheduler, CLI, and restarts share the same limit. A 429 also saves the server's cooldown for subsequent requests. This prevents a bulk close from immediately exhausting the group's request allowance.
 
-Telegram's Bot API uses TDLib, which can mark a poll closed in its cache before the underlying stop succeeds. A subsequent "poll can't be stopped" or "poll has already been closed" error, or `is_closed=true` obtained by editing message markup, does not independently prove that voting has stopped on Telegram. The companion no longer uses markup edits to recover final results. These ambiguous errors place the poll in `closure_unverified` without applying a new outcome.
+A final outcome requires a successful `stopPoll` response with the expected poll ID, a closed flag, and valid option counts. That acknowledged response is durably recorded before votes are applied, so downstream failures can reuse it without another stop request. A cached `is_closed` flag obtained by editing a message is never a final result.
 
-On upgrade, older cached results without acknowledged-response provenance are retained for audit and marked unverified. Their poll records enter a review hold. Recorded counts, previous state, and exclusion ownership remain available, and existing Maintainerr exclusions are not removed. The scheduler skips these holds, including temporary-exclusion expiry; default manual runs also skip them.
+A failed close remains an ordinary open poll with its close request recorded. The next scheduler cycle automatically retries it, even if an administrator requested the close before `POLL_DAYS`. There is no manual hold state or special recovery flag. Actual Telegram errors remain fully logged, and failed requests never authorize vote outcomes.
 
-An operator can explicitly preview attempts to close the held polls:
-
-```bash
-docker compose run --rm -T maintainerr-telegram-polls python close_polls.py --days 0 --retry-unverified
-```
-
-Adding `--execute` attempts real closures, including polls still accepting votes. An ambiguous error remains a hold. This option does not clear Telegram's server-side cache and may still require investigation or independent closure verification. Existing protections from earlier unverified outcomes remain in place and require separate review, even after a later voting result changes.
-
-**A review hold does not pause Maintainerr's independent deletion timer.** Keep the deletion safety requirements below in place while investigating. Do not reset the database or substitute cached counts for acknowledged final results.
+Upgrades discard the superseded unverified snapshots and review table while retaining acknowledged final results. Existing premature exclusions from the earlier incorrect recovery must be reconciled separately; the journal migration never deletes arbitrary Maintainerr protections.
 
 ### Telegram rate limits
 
 Both the scheduled bot and manual CLI use the same Telegram request handler. On HTTP 429 or a JSON response with error code 429, it waits for Telegram's `parameters.retry_after` seconds plus a one-second buffer, then retries the identical request. Without a valid retry delay it uses exponential backoff (5, 10, 20, 40, then 60 seconds). Each request permits five retries; exhaustion leaves its error visible and an unprocessed poll available for a later attempt. Long waits are logged and split into at most 60-second sleeps.
 
-Ambiguous network timeouts are not blindly retried: a timed-out `sendPoll` or `sendPhoto` may already have succeeded. A later close retry requires an acknowledged stop response; ambiguous cached-closure errors become review holds.
+Ambiguous network timeouts are not blindly retried: a timed-out `sendPoll` or `sendPhoto` may already have succeeded. Failed closes remain open and are automatically retried by the scheduler; no cached closure error is treated as success.
 
 ### Stale polls with missing Maintainerr metadata
 

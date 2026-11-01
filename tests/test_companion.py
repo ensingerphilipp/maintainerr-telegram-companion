@@ -11,6 +11,7 @@ import close_polls
 import covers
 
 real_metadata_exists = bot.metadata_exists
+real_pace_telegram = bot.pace_telegram
 
 
 class PollTests(unittest.TestCase):
@@ -26,6 +27,9 @@ class PollTests(unittest.TestCase):
         self.metadata_patcher = patch.object(bot, "metadata_exists", return_value=True)
         self.metadata_patcher.start()
         self.addCleanup(self.metadata_patcher.stop)
+        self.pace_patcher = patch.object(bot, "pace_telegram")
+        self.pace_patcher.start()
+        self.addCleanup(self.pace_patcher.stop)
 
     def insert(self, mid, days_old=3):
         self.db.execute(
@@ -124,8 +128,7 @@ class PollTests(unittest.TestCase):
                 bot.telegram("stopPoll", {})
 
 
-
-    def test_unrelated_telegram_error_does_not_trigger_recovery(self):
+    def test_unrelated_telegram_error_does_not_apply_outcome(self):
         rec = self.insert("1")
         error = bot.TelegramAPIError("stopPoll", 400, "Bad Request: message not found")
         with patch.object(bot, "tg", side_effect=error) as telegram:
@@ -140,7 +143,7 @@ class PollTests(unittest.TestCase):
              patch.object(bot.voting, "save_votes", side_effect=RuntimeError("write failed")):
             with self.assertRaisesRegex(RuntimeError, "write failed"):
                 bot.close_due(self.db, rec, min_age_days=0)
-        recorded_at = self.db.execute("SELECT recorded_at FROM closed_poll_results").fetchone()[0]
+        recorded_at = self.db.execute("SELECT recorded_at FROM final_poll_results").fetchone()[0]
         with patch.object(bot, "tg") as telegram, \
              patch.object(bot.voting, "start_snooze") as snooze:
             bot.close_due(self.db, rec, min_age_days=0)
@@ -156,7 +159,7 @@ class PollTests(unittest.TestCase):
         with patch.object(bot, "tg", return_value=poll):
             with self.assertRaisesRegex(RuntimeError, "counts"):
                 bot.close_due(self.db, rec, min_age_days=0)
-        self.assertEqual(self.db.execute("SELECT count(*) FROM closed_poll_results").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM final_poll_results").fetchone()[0], 0)
 
 
     def test_http_429_keeps_retry_after_parameters(self):
@@ -201,7 +204,7 @@ class PollTests(unittest.TestCase):
         self.assertEqual(telegram.call_count, 6)
         self.assertEqual([c.args[0] for c in sleep.call_args_list], [5, 10, 20, 40, 60])
         self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "open")
-        self.assertEqual(self.db.execute("SELECT count(*) FROM closed_poll_results").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM final_poll_results").fetchone()[0], 0)
 
     def test_non_429_and_network_timeouts_are_not_retried(self):
         for error in (bot.TelegramAPIError("sendPoll", 400, "bad request"), TimeoutError()):
@@ -236,126 +239,6 @@ class PollTests(unittest.TestCase):
             self.assertEqual(close_polls.main(["--days", "0", "--execute"]), 0)
         self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "released")
 
-    def test_cached_closed_error_holds_poll_without_reading_message_or_applying_votes(self):
-        rec = self.insert("1")
-        error = bot.TelegramAPIError("stopPoll", 400, "Bad Request: poll can't be stopped")
-        with patch.object(bot, "tg", side_effect=error) as telegram, \
-             patch.object(bot, "maintain") as maintain:
-            with self.assertRaisesRegex(bot.PollClosureUnverified, "no successful stopPoll"):
-                bot.close_due(self.db, rec, min_age_days=0)
-        telegram.assert_called_once_with("stopPoll", {"chat_id": bot.CHAT, "message_id": 1})
-        maintain.assert_not_called()
-        self.assertEqual(self.db.execute("SELECT state,keep_votes FROM polls").fetchone(),
-                         ("closure_unverified", None))
-        self.assertEqual(self.db.execute("SELECT count(*) FROM closed_poll_results").fetchone()[0], 0)
-
-    def test_429_followed_by_cached_closed_error_never_finalizes_votes(self):
-        rec = self.insert("1")
-        errors = [
-            bot.TelegramAPIError("stopPoll", 429, "rate limited", {"retry_after": 1}),
-            bot.TelegramAPIError("stopPoll", 400, "Bad Request: poll can't be stopped"),
-        ]
-        with patch.object(bot, "telegram", side_effect=errors) as telegram, \
-             patch.object(bot.time, "sleep") as sleep, patch.object(bot, "maintain") as maintain:
-            with self.assertRaises(bot.PollClosureUnverified):
-                bot.close_due(self.db, rec, min_age_days=0)
-        sleep.assert_called_once_with(2)
-        self.assertEqual(telegram.call_count, 2)
-        maintain.assert_not_called()
-        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "closure_unverified")
-
-    def test_migration_holds_legacy_cache_and_preserves_votes_and_protection_ownership(self):
-        self.insert("1")
-        self.db.execute("UPDATE polls SET state='snoozed',keep_votes=0,postpone_votes=2,"
-                        "owned_exclusion_ids='[77]',snooze_until='2027-01-01T00:00:00+00:00'")
-        self.db.execute("DROP TABLE closed_poll_results")
-        self.db.execute("CREATE TABLE closed_poll_results("
-                        "poll_id TEXT PRIMARY KEY,payload TEXT NOT NULL,recorded_at TEXT NOT NULL)")
-        self.db.execute("INSERT INTO closed_poll_results VALUES (?,?,?)",
-                        ("poll-1", '{"is_closed":true}', bot.iso(bot.now())))
-        self.db.commit()
-        with patch.object(bot, "maintain") as maintain, patch.object(bot, "tg") as telegram:
-            upgraded = bot.database()
-            upgraded.close()
-            upgraded = bot.database()
-            upgraded.close()
-        maintain.assert_not_called()
-        telegram.assert_not_called()
-        self.assertEqual(self.db.execute("SELECT state,postpone_votes,owned_exclusion_ids,snooze_until "
-                                         "FROM polls").fetchone(),
-                         ("closure_unverified", 2, "[77]", "2027-01-01T00:00:00+00:00"))
-        self.assertEqual(self.db.execute("SELECT source FROM closed_poll_results").fetchone()[0], "unverified")
-        self.assertEqual(self.db.execute("SELECT prior_state FROM poll_closure_reviews").fetchall(), [("snoozed",)])
-
-    def test_migration_keeps_acknowledged_cache_trusted(self):
-        self.insert("1")
-        self.db.execute("UPDATE polls SET state='released'")
-        self.db.execute("INSERT INTO closed_poll_results VALUES (?,?,?,'stopPoll')",
-                        ("poll-1", "{}", bot.iso(bot.now())))
-        self.db.commit()
-        upgraded = bot.database()
-        upgraded.close()
-        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "released")
-        self.assertEqual(self.db.execute("SELECT count(*) FROM poll_closure_reviews").fetchone()[0], 0)
-
-    def test_default_paths_do_not_close_held_polls(self):
-        rec = self.insert("1", days_old=40)
-        self.db.execute("UPDATE polls SET state='closure_unverified'")
-        self.db.commit()
-        rec = self.db.execute("SELECT * FROM polls").fetchone()
-        with patch.object(bot, "tg") as telegram:
-            bot.close_due(self.db, rec)
-        telegram.assert_not_called()
-        self.assertEqual(close_polls.eligible([rec], 0, bot.now()), [])
-        self.assertEqual(close_polls.eligible([rec], 0, bot.now(), include_unverified=True), [rec])
-
-    def test_explicit_retry_replaces_untrusted_counts_only_after_successful_stop(self):
-        import json
-        self.insert("1")
-        self.db.execute("UPDATE polls SET state='closure_unverified',keep_votes=0,delete_votes=7")
-        self.db.execute("INSERT INTO closed_poll_results VALUES (?,?,?,'unverified')",
-                        ("poll-1", json.dumps(self.closed_poll(delete=7)), bot.iso(bot.now())))
-        self.db.commit()
-        rec = self.db.execute("SELECT * FROM polls").fetchone()
-        with patch.object(bot, "tg", return_value=self.closed_poll(keep=1, delete=7)) as telegram, \
-             patch.object(bot.voting, "permanent_veto") as veto:
-            bot.close_due(self.db, rec, min_age_days=0, retry_unverified=True)
-        telegram.assert_called_once()
-        veto.assert_called_once()
-        self.assertEqual(self.db.execute("SELECT state,keep_votes FROM polls").fetchone(), ("veto_pending", 1))
-        self.assertEqual(self.db.execute("SELECT source FROM closed_poll_results").fetchone()[0], "stopPoll")
-
-    def test_explicit_retry_cannot_reuse_untrusted_cached_zero_veto(self):
-        import json
-        self.insert("1")
-        self.db.execute("UPDATE polls SET state='closure_unverified',keep_votes=0,delete_votes=7")
-        self.db.execute("INSERT INTO closed_poll_results VALUES (?,?,?,'unverified')",
-                        ("poll-1", json.dumps(self.closed_poll(delete=7)), bot.iso(bot.now())))
-        self.db.commit()
-        rec = self.db.execute("SELECT * FROM polls").fetchone()
-        with patch.object(bot, "tg", side_effect=bot.TelegramAPIError(
-                "stopPoll", 400, "Bad Request: poll has already been closed")), \
-             patch.object(bot, "maintain") as maintain:
-            with self.assertRaises(bot.PollClosureUnverified):
-                bot.close_due(self.db, rec, min_age_days=0, retry_unverified=True)
-        maintain.assert_not_called()
-        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "closure_unverified")
-        self.assertEqual(self.db.execute("SELECT source FROM closed_poll_results").fetchone()[0], "unverified")
-
-    def test_manual_cli_explicit_retry_reports_unverified_failure(self):
-        from contextlib import nullcontext, redirect_stdout
-        import io
-        self.insert("1")
-        self.db.execute("UPDATE polls SET state='closure_unverified'")
-        self.db.commit()
-        with patch.object(bot, "telegram", side_effect=bot.TelegramAPIError(
-                "stopPoll", 400, "Bad Request: poll can't be stopped")), \
-             patch.object(bot, "TOKEN", "test-token"), patch.object(bot, "CHAT", "test-chat"), \
-             patch.object(bot, "execution_lock", return_value=nullcontext()), \
-             redirect_stdout(io.StringIO()), self.assertLogs(level="ERROR"):
-            code = close_polls.main(["--days", "0", "--retry-unverified", "--execute"])
-        self.assertEqual(code, 1)
-        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "closure_unverified")
 
     def test_successful_stop_with_wrong_identity_or_open_flag_is_not_saved(self):
         rec = self.insert("1")
@@ -366,7 +249,7 @@ class PollTests(unittest.TestCase):
                 with patch.object(bot, "tg", return_value=poll):
                     with self.assertRaisesRegex(RuntimeError, "identity or closed state"):
                         bot.close_due(self.db, rec, min_age_days=0)
-        self.assertEqual(self.db.execute("SELECT count(*) FROM closed_poll_results").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM final_poll_results").fetchone()[0], 0)
 
     def test_http_failure_logs_full_reason_context_headers_and_redacts_tokens(self):
         import io
@@ -532,16 +415,6 @@ class PollTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError):
                 real_metadata_exists("1")
 
-    def test_unverified_cache_migration_does_not_erase_stale_classification(self):
-        self.insert("1")
-        self.db.execute("INSERT INTO closed_poll_results VALUES (?,?,?,'unverified')",
-                        ("poll-1", "{}", bot.iso(bot.now())))
-        self.db.commit()
-        with patch.object(bot, "metadata_exists", return_value=False):
-            bot.refresh_poll_metadata(self.db)
-        upgraded = bot.database()
-        upgraded.close()
-        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "stale")
 
     def test_bulk_missing_metadata_error_requires_matching_media_and_exact_reason(self):
         response = {"results": [{"mediaId": "1", "code": 0, "message": "Failed - no metadata"}]}
@@ -601,6 +474,103 @@ class PollTests(unittest.TestCase):
         publish.assert_not_called()
         self.assertEqual(self.db.execute("SELECT count(*) FROM polls").fetchone()[0], 0)
         self.assertEqual(self.db.execute("SELECT count(*) FROM stale_poll_archive").fetchone()[0], 1)
+
+    def test_failed_close_stays_open_and_is_retried_automatically(self):
+        rec = self.insert("1", days_old=1)
+        error = bot.TelegramAPIError("stopPoll", 400, "Bad Request: poll can't be stopped")
+        with patch.object(bot, "tg", side_effect=error):
+            with self.assertRaises(bot.TelegramAPIError):
+                bot.close_due(self.db, rec, min_age_days=0)
+        self.assertEqual(self.db.execute("SELECT state,keep_votes FROM polls").fetchone(), ("open", None))
+        self.assertIsNotNone(self.db.execute("SELECT close_requested_at FROM polls").fetchone()[0])
+        with patch.object(bot, "TOKEN", "test-token"), patch.object(bot, "CHAT", "test-chat"), \
+             patch.object(bot, "check_collections", return_value={}), \
+             patch.object(bot.covers, "backfill"), patch.object(bot, "members", return_value=[]), \
+             patch.object(bot, "tg", return_value=self.closed_poll()) as telegram:
+            bot.sync()
+        telegram.assert_called_once_with("stopPoll", {"chat_id": "test-chat", "message_id": 1})
+        self.assertEqual(self.db.execute("SELECT state,close_requested_at FROM polls").fetchone(),
+                         ("released", None))
+
+    def test_429_then_400_does_not_finalize_or_create_a_manual_hold(self):
+        rec = self.insert("1")
+        errors = [bot.TelegramAPIError("stopPoll",429,"limited",{"retry_after":1}),
+                  bot.TelegramAPIError("stopPoll",400,"Bad Request: poll can't be stopped")]
+        with patch.object(bot, "telegram", side_effect=errors), patch.object(bot.time, "sleep"), \
+             patch.object(bot, "maintain") as maintain:
+            with self.assertRaises(bot.TelegramAPIError):
+                bot.close_due(self.db, rec, min_age_days=0)
+        maintain.assert_not_called()
+        self.assertEqual(self.db.execute("SELECT state,keep_votes FROM polls").fetchone(), ("open", None))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM final_poll_results").fetchone()[0], 0)
+
+    def test_upgrade_removes_bad_recovery_data_and_preserves_acknowledged_results(self):
+        import json
+        self.insert("1")
+        self.insert("2")
+        self.db.execute("UPDATE polls SET state='closure_unverified',keep_votes=0,"
+                        "postpone_votes=3,owned_exclusion_ids='[77]' WHERE media_id='1'")
+        self.db.execute("UPDATE polls SET state='vetoed',keep_votes=2 WHERE media_id='2'")
+        self.db.execute("CREATE TABLE closed_poll_results("
+                        "poll_id TEXT PRIMARY KEY,payload TEXT,recorded_at TEXT,source TEXT)")
+        self.db.execute("INSERT INTO closed_poll_results VALUES (?,?,?,'unverified')",
+                        ("poll-1",json.dumps(self.closed_poll(snooze=3)),bot.iso(bot.now())))
+        self.db.execute("INSERT INTO closed_poll_results VALUES (?,?,?,'stopPoll')",
+                        ("poll-2",'{"id":"poll-2","is_closed":true}',bot.iso(bot.now())))
+        self.db.execute("CREATE TABLE poll_closure_reviews(poll_id TEXT)")
+        self.db.commit()
+        upgraded=bot.database()
+        upgraded.close()
+        tables={r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertNotIn("closed_poll_results",tables)
+        self.assertNotIn("poll_closure_reviews",tables)
+        self.assertEqual(self.db.execute(
+            "SELECT state,keep_votes,postpone_votes,owned_exclusion_ids FROM polls WHERE media_id='1'"
+        ).fetchone(),("open",None,None,"[77]"))
+        self.assertIsNotNone(self.db.execute(
+            "SELECT close_requested_at FROM polls WHERE media_id='1'").fetchone()[0])
+        self.assertEqual(self.db.execute(
+            "SELECT state,keep_votes FROM polls WHERE media_id='2'").fetchone(),("vetoed",2))
+        self.assertEqual(self.db.execute("SELECT poll_id,proof FROM final_poll_results").fetchall(),
+                         [("poll-2","stopPoll")])
+
+    def test_final_result_journal_cannot_store_unverified_snapshots(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("INSERT INTO final_poll_results VALUES (?,?,?,'unverified')",
+                            ("poll-1","{}",bot.iso(bot.now())))
+
+    def test_cli_retry_uses_the_normal_execute_command(self):
+        from contextlib import nullcontext,redirect_stdout
+        import io
+        self.insert("1")
+        with patch.object(bot, "telegram", side_effect=bot.TelegramAPIError(
+                "stopPoll",400,"Bad Request: poll can't be stopped")), \
+             patch.object(bot,"TOKEN","test-token"),patch.object(bot,"CHAT","test-chat"), \
+             patch.object(bot,"execution_lock",return_value=nullcontext()), \
+             redirect_stdout(io.StringIO()),self.assertLogs(level="ERROR"):
+            self.assertEqual(close_polls.main(["--days","0","--execute"]),1)
+        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0],"open")
+
+    def test_telegram_pacing_is_persisted_and_scoped_by_chat(self):
+        clock=[1000.0]
+        def sleep(seconds):clock[0]+=seconds
+        with patch.object(bot.time,"time",side_effect=lambda:clock[0]), \
+             patch.object(bot.time,"sleep",side_effect=sleep) as waits:
+            real_pace_telegram("stopPoll",{"chat_id":1})
+            real_pace_telegram("stopPoll",{"chat_id":1})
+            real_pace_telegram("sendPoll",{"chat_id":2})
+            real_pace_telegram("editMessageReplyMarkup",{"chat_id":1})
+        self.assertEqual(waits.call_count,2)
+        self.assertAlmostEqual(sum(c.args[0] for c in waits.call_args_list),6.4)
+
+    def test_429_cooldown_survives_into_the_next_request(self):
+        clock=[1000.0]
+        def sleep(seconds):clock[0]+=seconds
+        with patch.object(bot.time,"time",side_effect=lambda:clock[0]), \
+             patch.object(bot.time,"sleep",side_effect=sleep) as waits:
+            bot.record_telegram_cooldown(42)
+            real_pace_telegram("getMe",{})
+        waits.assert_called_once_with(42)
 
     def test_cover_url_is_strict(self):
         self.assertEqual(
