@@ -477,7 +477,7 @@ class PollTests(unittest.TestCase):
 
     def test_failed_close_stays_open_and_is_retried_automatically(self):
         rec = self.insert("1", days_old=1)
-        error = bot.TelegramAPIError("stopPoll", 400, "Bad Request: poll can't be stopped")
+        error = bot.TelegramAPIError("stopPoll", 500, "Internal Server Error")
         with patch.object(bot, "tg", side_effect=error):
             with self.assertRaises(bot.TelegramAPIError):
                 bot.close_due(self.db, rec, min_age_days=0)
@@ -495,10 +495,11 @@ class PollTests(unittest.TestCase):
     def test_429_then_400_does_not_finalize_or_create_a_manual_hold(self):
         rec = self.insert("1")
         errors = [bot.TelegramAPIError("stopPoll",429,"limited",{"retry_after":1}),
+                  bot.TelegramAPIError("stopPoll",400,"Bad Request: poll can't be stopped"),
                   bot.TelegramAPIError("stopPoll",400,"Bad Request: poll can't be stopped")]
         with patch.object(bot, "telegram", side_effect=errors), patch.object(bot.time, "sleep"), \
              patch.object(bot, "maintain") as maintain:
-            with self.assertRaises(bot.TelegramAPIError):
+            with self.assertRaises(bot.recovery.Deferred):
                 bot.close_due(self.db, rec, min_age_days=0)
         maintain.assert_not_called()
         self.assertEqual(self.db.execute("SELECT state,keep_votes FROM polls").fetchone(), ("open", None))

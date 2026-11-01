@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import voting
 import covers
+import recovery
 
 ROOT=Path(__file__).resolve().parent
 DB=ROOT/"polls.sqlite"
@@ -107,7 +108,7 @@ TELEGRAM_CHAT_INTERVAL = 3.2
 TELEGRAM_MUTATIONS = {"sendMessage", "sendPhoto", "sendPoll", "stopPoll",
                       "editMessageReplyMarkup", "deleteMessage"}
 
-def pace_telegram(method, body):
+def pace_telegram(method, body, *, nonblocking=False):
     rate = sqlite3.connect(DB, timeout=30)
     try:
         rate.execute("BEGIN IMMEDIATE")
@@ -120,8 +121,12 @@ def pace_telegram(method, body):
             scope = "chat:" + str(body["chat_id"])
             chat_row = rate.execute("SELECT next_allowed FROM telegram_rate_limits WHERE scope=?", (scope,)).fetchone()
             ready = max(ready, chat_row[0] if chat_row else current)
+            if nonblocking and ready > current:
+                raise recovery.Deferred('Telegram pacing or flood cooldown', ready)
             rate.execute("INSERT OR REPLACE INTO telegram_rate_limits VALUES (?,?)",
                          (scope, ready + TELEGRAM_CHAT_INTERVAL))
+        elif nonblocking and ready > current:
+            raise recovery.Deferred('Telegram flood cooldown', ready)
         rate.commit()
     finally:
         rate.close()
@@ -147,11 +152,16 @@ def record_telegram_cooldown(delay):
     finally:
         rate.close()
 
-def tg(method,body):
+def tg(method,body,*,max_retries=TELEGRAM_MAX_RETRIES,nonblocking=False,recovery_control=False):
+    if not recovery_control:
+        recovery.guard(DB, method)
     request_id = f"{time.time_ns():x}"
     target = telegram_target(body)
-    for attempt in range(TELEGRAM_MAX_RETRIES + 1):
-        pace_telegram(method, body)
+    for attempt in range(max_retries + 1):
+        if nonblocking:
+            pace_telegram(method, body, nonblocking=True)
+        else:
+            pace_telegram(method, body)
         started = time.monotonic()
         try:
             r = telegram(method, body)
@@ -165,7 +175,7 @@ def tg(method,body):
                         "attempt=%s elapsed_ms=%.1f", request_id, method, target, attempt + 1, elapsed)
             return r["result"]
         except TelegramAPIError as exc:
-            retry = exc.code == 429 and attempt < TELEGRAM_MAX_RETRIES
+            retry = exc.code == 429 and attempt < max_retries
             delay = (exc.retry_after + 1 if exc.retry_after is not None
                      else min(5 * 2**attempt, 60)) if retry else None
             logging.log(logging.WARNING if retry else logging.ERROR,
@@ -173,7 +183,7 @@ def tg(method,body):
                         "attempt=%s/%s elapsed_ms=%.1f http_status=%s error_code=%s "
                         "description=%r parameters=%s retry_after=%s retry_in=%s "
                         "will_retry=%s headers=%s response=%s",
-                        request_id, method, target, attempt + 1, TELEGRAM_MAX_RETRIES + 1,
+                        request_id, method, target, attempt + 1, max_retries + 1,
                         (time.monotonic() - started) * 1000, exc.http_status, exc.api_code,
                         exc.description, diagnostic_json(exc.parameters), exc.retry_after,
                         delay, retry, exc.headers_text, exc.response_text)
@@ -243,6 +253,7 @@ def database():
     c.execute("UPDATE polls SET stale_previous_state='open' WHERE stale_previous_state='closure_unverified'")
     c.execute("DROP TABLE IF EXISTS poll_closure_reviews")
     c.commit()
+    recovery.migrate(c)
     return c
 def metadata_exists(media_id):
     path = "/api/media-server/meta/" + urllib.parse.quote(str(media_id), safe="")
@@ -385,7 +396,7 @@ def final_poll(c, rec):
     if acknowledged:
         result, closed_at = json.loads(cached[0]), parse(cached[1])
     else:
-        result = tg("stopPoll", {"chat_id": CHAT, "message_id": rec[3]})
+        result = recovery.stop_poll(c, rec, CHAT, tg, time.time, TelegramAPIError)
         closed_at = now()
     if result.get("id") != rec[4] or result.get("is_closed") is not True:
         raise RuntimeError(f"Final poll identity or closed state not confirmed: {rec[2]}")
@@ -400,6 +411,7 @@ def final_poll(c, rec):
             payload=excluded.payload,recorded_at=excluded.recorded_at,proof=excluded.proof""",
             (rec[4], json.dumps(result), iso(closed_at)))
         c.commit()
+    recovery.resolved(c, rec[4])
     logging.info("event=poll_close_result collection_id=%s media_id=%s poll_id=%s "
                  "message_id=%s source=%s is_closed=%s counts=%s recorded_at=%s",
                  rec[0], rec[1], rec[4], rec[3], "acknowledged_cache" if acknowledged else "stopPoll",
@@ -407,6 +419,11 @@ def final_poll(c, rec):
     return result, closed_at
 
 def close_due(c,rec,min_age_days=POLL_DAYS,*,metadata_checked=False):
+    # A recovery pass may already have finalized a tuple loaded earlier.
+    current=c.execute('SELECT * FROM polls WHERE poll_id=?',(rec[4],)).fetchone()
+    if current is None:
+        return
+    rec=current
     cid,media_id,title,msg,_,opened,_,_,_,state=rec[:10]
     if min_age_days < 0:
         raise ValueError("min_age_days must be nonnegative")
@@ -429,22 +446,80 @@ def close_due(c,rec,min_age_days=POLL_DAYS,*,metadata_checked=False):
     snooze=int(options[1]["voter_count"]) if len(options)==3 else 0
     deleted=int(options[-1]["voter_count"])
     outcome=voting.save_votes(c,rec,kept,snooze,deleted,lambda: closed_at,iso)
-    c.execute("UPDATE polls SET close_requested_at=NULL WHERE collection_id=? AND media_id=?",
-              (cid,media_id))
-    c.commit()
     logging.info("Closed %s: veto=%d snooze=%d okay=%d => %s",title,kept,snooze,deleted,outcome)
+    current=c.execute('SELECT * FROM polls WHERE poll_id=?',(rec[4],)).fetchone()
+    reconcile_outcome(c,current)
+
+def reconcile_outcome(c, rec):
+    """Resume an acknowledged outcome without repeating the stop request."""
     try:
-        if kept:voting.permanent_veto(c,rec,maintain)
-        elif snooze:voting.start_snooze(c,rec,maintain)
+        if rec[9] == 'veto_pending':
+            voting.permanent_veto(c,rec,maintain)
+        elif rec[9] == 'snooze_pending':
+            voting.start_snooze(c,rec,maintain)
     except voting.MissingMetadataError as exc:
         mark_stale(c,rec,str(exc))
+    state = c.execute('SELECT state FROM polls WHERE poll_id=?',(rec[4],)).fetchone()
+    if state and state[0] in ('vetoed','snoozed','released','externally_protected'):
+        with c:
+            c.execute('UPDATE polls SET close_requested_at=NULL WHERE poll_id=?',(rec[4],))
+
+
+def resume_poll_recovery(c):
+    # Caller holds the shared scheduler/CLI lock. Control calls never block on a cooldown.
+    def control(method, body):
+        return tg(method,body,max_retries=0,nonblocking=True,recovery_control=True)
+    token_id = TOKEN.partition(':')[0]
+    mismatched=c.execute("""SELECT i.poll_id FROM poll_close_incidents i JOIN polls p
+        ON p.poll_id=i.poll_id WHERE i.phase='reset' AND p.state='open' AND i.chat_id!=?""",
+        (str(CHAT),)).fetchall()
+    if mismatched:
+        with c:
+            c.execute("UPDATE telegram_session_recovery SET phase='blocked' WHERE id=1")
+        logging.error('event=poll_recovery_target_mismatch polls=%s reason=configured_chat_changed',
+                      [row[0] for row in mismatched])
+        return
+    try:
+        recovery.resume(c,control,time.time,TelegramAPIError,TelegramTransportError,
+                        int(token_id) if token_id.isdecimal() else None)
+    except recovery.Deferred as exc:
+        logging.info('event=poll_recovery_pending reason=%r retry_at=%s',str(exc),exc.retry_at)
+        return
+    rows = c.execute("""SELECT p.* FROM polls p JOIN poll_close_incidents i ON i.poll_id=p.poll_id
+        WHERE p.state='open' AND i.phase='retry' AND i.next_attempt<=?""",(time.time(),)).fetchall()
+    for rec in rows:
+        try:
+            close_due(c,rec,min_age_days=0)
+        except recovery.Deferred as exc:
+            logging.info('event=poll_recovery_pending poll_id=%s reason=%r retry_at=%s',
+                         rec[4],str(exc),exc.retry_at)
+        except Exception:
+            logging.exception('event=poll_recovery_failed poll_id=%s message_id=%s',rec[4],rec[3])
+
+
+def next_cycle_delay():
+    c=sqlite3.connect(DB)
+    try:
+        if not c.execute("SELECT 1 FROM sqlite_master WHERE name='telegram_session_recovery'").fetchone():
+            return max(INTERVAL,60)
+        return recovery.next_wakeup(c,time.time(),max(INTERVAL,60))
+    finally:
+        c.close()
+
 def sync():
     if not TOKEN or not CHAT:
         logging.warning("Telegram credentials missing; not attempting polling")
         return
     c=database()
+    try:
+        sync_database(c)
+    finally:
+        c.close()
+
+def sync_database(c):
     collections=check_collections()
     metadata_failures=refresh_poll_metadata(c)
+    resume_poll_recovery(c)
     existing={(r[0],r[1]):r for r in c.execute("SELECT * FROM polls").fetchall()}
     # Always reconcile historical results, even for media no longer in a collection.
     for rec in existing.values():
@@ -452,16 +527,21 @@ def sync():
             continue
         try:
             if rec[9]=="open":close_due(c,rec,metadata_checked=True)
-            elif rec[9]=="veto_pending":voting.permanent_veto(c,rec,maintain)
-            elif rec[9]=="snooze_pending":voting.start_snooze(c,rec,maintain)
+            elif rec[9] in ("veto_pending","snooze_pending"):reconcile_outcome(c,rec)
             elif rec[9]=="snoozed":voting.finish_snooze(c,rec,maintain,now,parse)
             elif rec[9]=="timer_pending":reset_timer(c,rec[0],rec[1],rec[2])
         except voting.MissingMetadataError as exc:
             mark_stale(c,rec,str(exc))
+        except recovery.Deferred as exc:
+            logging.info('event=poll_close_pending poll_id=%s message_id=%s reason=%r retry_at=%s',
+                         rec[4],rec[3],str(exc),exc.retry_at)
         except Exception:
             logging.exception("Poll reconciliation failure title=%r collection_id=%s media_id=%s "
                               "poll_id=%s message_id=%s state=%s",
                               rec[2],rec[0],rec[1],rec[4],rec[3],rec[9])
+    resume_poll_recovery(c)
+    if recovery.session(c)['phase'] in ('preflight','closing','close_sent','reconnecting'):
+        return
     covers.backfill(c,IDS,members,tg,CHAT,limit=2)
     created=0
     for cid in IDS:
@@ -487,7 +567,6 @@ def sync():
                 except Exception:
                     logging.exception("Could not start poll for %s",key)
                     break
-    c.close()
 if __name__=="__main__":
     logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
     logging.info("Starting companion: publish=%s collections=%s (never deletes media)",ENABLED,IDS)
@@ -495,5 +574,12 @@ if __name__=="__main__":
         try:
             with execution_lock():
                 sync()
+        except recovery.Deferred as exc:
+            logging.info('event=telegram_cycle_deferred reason=%r retry_at=%s',str(exc),exc.retry_at)
         except Exception:logging.exception("Reconciliation cycle failed")
-        time.sleep(max(INTERVAL,60))
+        try:
+            delay=next_cycle_delay()
+        except Exception:
+            logging.exception('Could not read recovery deadline')
+            delay=max(INTERVAL,60)
+        time.sleep(delay)

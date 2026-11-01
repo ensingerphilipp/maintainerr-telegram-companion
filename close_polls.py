@@ -5,6 +5,7 @@ import logging
 import sys
 from datetime import timedelta
 import bot
+import recovery
 
 def eligible(rows, days, timestamp):
     cutoff=timestamp-timedelta(days=days)
@@ -39,30 +40,54 @@ def main(argv=None):
                 print("No Telegram or Maintainerr changes. Add --execute to close and evaluate these polls.",flush=True)
                 return 0
             failed=len(metadata_failures)
-            processed=0
             ignored=stale_count+archived_count
+            bot.resume_poll_recovery(db)
+            # Also finish acknowledged outcomes interrupted by an earlier process.
+            for row in db.execute("SELECT * FROM polls WHERE state IN ('veto_pending','snooze_pending')").fetchall():
+                if (row[0],row[1]) in metadata_failures:
+                    continue
+                try:
+                    bot.reconcile_outcome(db,row)
+                except Exception:
+                    failed+=1
+                    logging.exception('Outcome reconciliation failed poll_id=%s title=%r',row[4],row[2])
             for row in matches:
                 if (row[0],row[1]) in metadata_failures:
                     continue
                 try:
-                    bot.close_due(db,row,min_age_days=args.days,metadata_checked=True)
-                    found=db.execute("SELECT state FROM polls WHERE collection_id=? AND media_id=?",
-                                     (row[0],row[1])).fetchone()
-                    status=found[0] if found else "archived_stale"
-                    if status in ("stale","archived_stale"):
-                        ignored+=1
-                        print(f"IGNORED: {row[2]!r} -> {status}",flush=True)
-                    else:
-                        processed+=1
-                        print(f"DONE: {row[2]!r} -> {status}",flush=True)
+                    current=db.execute('SELECT * FROM polls WHERE poll_id=?',(row[4],)).fetchone()
+                    if current and current[9]=='open':
+                        bot.close_due(db,current,min_age_days=args.days,metadata_checked=True)
+                except recovery.Deferred as exc:
+                    logging.info('event=poll_close_pending poll_id=%s reason=%r retry_at=%s',
+                                 row[4],str(exc),exc.retry_at)
                 except Exception:
                     failed+=1
                     logging.exception("FAILED title=%r collection_id=%s media_id=%s poll_id=%s "
                                       "chat_id=%s message_id=%s state_before=%s",
                                       row[2],row[0],row[1],row[4],bot.redact_diagnostic(bot.CHAT),
                                       row[3],row[9])
-            print(f"Finished: {processed} processed, {ignored} ignored as stale, {failed} failed",flush=True)
-            return 1 if failed else 0
+            bot.resume_poll_recovery(db)
+            processed=pending=0
+            if recovery.session(db)['phase']=='blocked':
+                failed+=1
+            for row in matches:
+                if (row[0],row[1]) in metadata_failures:
+                    continue
+                found=db.execute('SELECT state FROM polls WHERE poll_id=?',(row[4],)).fetchone()
+                status=found[0] if found else 'archived_stale'
+                if status in ('stale','archived_stale'):
+                    ignored+=1
+                    label='IGNORED'
+                elif status in ('released','vetoed','snoozed','externally_protected'):
+                    processed+=1
+                    label='DONE'
+                else:
+                    pending+=1
+                    label='PENDING'
+                print(f"{label}: {row[2]!r} -> {status}",flush=True)
+            print(f"Finished: {processed} processed, {ignored} ignored as stale, {failed} failed, {pending} pending",flush=True)
+            return 1 if failed else 2 if pending else 0
         finally:
             db.close()
 

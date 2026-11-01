@@ -165,6 +165,18 @@ A final outcome requires a successful `stopPoll` response with the expected poll
 
 A failed close remains an ordinary open poll with its close request recorded. The next scheduler cycle automatically retries it, even if an administrator requested the close before `POLL_DAYS`. There is no manual hold state or special recovery flag. Actual Telegram errors remain fully logged, and failed requests never authorize vote outcomes.
 
+### Automatic session recovery
+
+The bot and executing CLI recognize the specific HTTP/API 400 descriptions `poll can't be stopped` and `poll has already been closed` for a tracked original poll with no acknowledged final response. They confirm the failure with one paced retry. Two matching failures queue recovery; unrelated 400s, permissions errors, missing metadata, and 429s alone do not trigger a reset. This identifies a suspected session inconsistency, not proof that a poll is closed.
+
+Recovery is shared across the affected batch under the scheduler/CLI execution lock. It checks the bot identity and verifies that no webhook is configured, calls Telegram's `close` method, reconnects with `getMe`, and retries the original poll closures. It does not change webhooks, call `logOut`, edit messages, or consume/acknowledge pending updates. Only a successful, validated `stopPoll` response authorizes final votes. The normal scheduler also resumes Maintainerr outcomes left pending after a successful close; the CLI resumes those outcomes during `--execute`.
+
+The SQLite tables `poll_close_incidents` and `telegram_session_recovery` persist the recovery phase, target IDs, failure reason/count, reset generation, and retry deadlines. Telegram's `retry_after` is respected without sleeping through session recovery cooldowns. Temporary reconnect errors use bounded exponential backoff. The scheduler shortens its next sleep when recovery is due. After downtime it resumes the saved phase using calendar time; it does not replay missed resets or require an extra ten-minute wait after reconnecting.
+
+A reset reserves a **one-hour global cooldown before the external call**, and each unresolved poll incident gets at most one recovery reset. A restart around an ambiguous `close` probes the connection instead of blindly issuing another reset. A poll that still returns the same error after recovery remains open with an ERROR diagnostic and at most hourly closure retries; it cannot repeatedly reset the API instance. Identity mismatches, configured webhooks, and nonretryable recovery errors block automatic reset and produce an ERROR diagnostic while preserving poll data. No periodic or startup reset is performed.
+
+The CLI reports **PENDING**, rather than DONE, when recovery or Maintainerr reconciliation is incomplete. Exit status is **0** for completed work, **1** for failures, and **2** for pending work without another failure. The scheduler continues pending recovery after the CLI exits. All recovery steps are included in the normal structured logs with poll IDs and a reset generation; no manual recovery files are generated.
+
 Upgrades discard the superseded unverified snapshots and review table while retaining acknowledged final results. Existing premature exclusions from the earlier incorrect recovery must be reconciled separately; the journal migration never deletes arbitrary Maintainerr protections.
 
 ### Telegram rate limits
@@ -225,7 +237,7 @@ docker compose logs -f maintainerr-telegram-polls
 python3 -m unittest discover -s tests -v
 
 # Syntax check
-python3 -m compileall -q bot.py voting.py covers.py close_polls.py
+python3 -m compileall -q bot.py voting.py covers.py close_polls.py recovery.py
 ```
 
 The bot has no admin web interface or inbound Telegram commands. Poll management is performed using the CLI.

@@ -59,8 +59,10 @@ def apply_exclusion(maintain, cid, media_id):
 
 def permanent_veto(db, row, maintain):
     cid, mid = row[0], row[1]
-    apply_exclusion(maintain, cid, mid)
     rows = scoped_ids(maintain, cid)
+    if not relevant(rows, mid):
+        apply_exclusion(maintain, cid, mid)
+        rows = scoped_ids(maintain, cid)
     if not relevant(rows, mid):
         raise RuntimeError("Veto not confirmed in Maintainerr")
     db.execute("UPDATE polls SET state='vetoed' WHERE collection_id=? AND media_id=?",
@@ -70,7 +72,8 @@ def permanent_veto(db, row, maintain):
 
 def start_snooze(db, row, maintain):
     cid, mid = row[0], row[1]
-    before_raw = row[13]
+    # Always reload the committed baseline; the caller's tuple may predate it.
+    before_raw = db.execute('SELECT exclusion_before FROM polls WHERE poll_id=?', (row[4],)).fetchone()[0]
     if before_raw is None:
         before = sorted(relevant(scoped_ids(maintain, cid), mid))
         db.execute("UPDATE polls SET exclusion_before=? WHERE collection_id=? AND media_id=?",
@@ -82,8 +85,16 @@ def start_snooze(db, row, maintain):
         db.execute("UPDATE polls SET state='externally_protected' WHERE collection_id=? AND media_id=?", (cid,mid))
         db.commit()
         return
-    apply_exclusion(maintain, cid, mid)
     after = relevant(scoped_ids(maintain, cid), mid)
+    if after and before_raw is None:
+        # Another administrator protected it after our baseline read, before
+        # this process attempted any creation. Never claim that exclusion.
+        db.execute("UPDATE polls SET state='externally_protected' WHERE collection_id=? AND media_id=?", (cid,mid))
+        db.commit()
+        return
+    if not after:
+        apply_exclusion(maintain, cid, mid)
+        after = relevant(scoped_ids(maintain, cid), mid)
     owned = sorted(set(after) - set(before))
     if not owned:
         raise RuntimeError("No newly created exclusion to own")
