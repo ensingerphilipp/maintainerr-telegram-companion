@@ -77,8 +77,9 @@ def tg(method,body):
         except TelegramAPIError as exc:
             if exc.code != 429 or attempt == TELEGRAM_MAX_RETRIES:
                 raise
-            # Flood control means Telegram rejected this request, so retrying
-            # the identical operation is safe. Do not retry ambiguous network
+            # Repeat after the advertised delay. stopPoll still requires an
+            # acknowledged success; a later cached 400 must not finalize votes.
+            # Do not retry ambiguous network
             # timeouts here: sendPoll/sendPhoto could otherwise be duplicated.
             delay = exc.retry_after + 1 if exc.retry_after is not None else min(5 * 2**attempt, 60)
             logging.warning("Telegram %s rate limited; retry %s/%s in %ss",
@@ -100,7 +101,22 @@ def database():
     voting.migrate(c)
     covers.migrate(c)
     c.execute("""CREATE TABLE IF NOT EXISTS closed_poll_results(
-        poll_id TEXT PRIMARY KEY, payload TEXT NOT NULL, recorded_at TEXT NOT NULL)""")
+        poll_id TEXT PRIMARY KEY, payload TEXT NOT NULL, recorded_at TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'unverified')""")
+    fields = {r[1] for r in c.execute("PRAGMA table_info(closed_poll_results)")}
+    if "source" not in fields:
+        c.execute("ALTER TABLE closed_poll_results ADD COLUMN source TEXT NOT NULL DEFAULT 'unverified'")
+    c.execute("""CREATE TABLE IF NOT EXISTS poll_closure_reviews(
+        poll_id TEXT PRIMARY KEY, prior_state TEXT NOT NULL,
+        reason TEXT NOT NULL, marked_at TEXT NOT NULL)""")
+    # Older versions accepted a cached closed flag without a successful stop.
+    # Preserve snapshots, votes, and exclusion ownership, but freeze processing.
+    c.execute("""INSERT OR IGNORE INTO poll_closure_reviews
+        SELECT p.poll_id,p.state,?,? FROM polls p JOIN closed_poll_results r
+        ON r.poll_id=p.poll_id WHERE r.source!='stopPoll'""",
+        ("Legacy result has no acknowledged stopPoll response", iso(now())))
+    c.execute("""UPDATE polls SET state='closure_unverified' WHERE poll_id IN
+        (SELECT poll_id FROM closed_poll_results WHERE source!='stopPoll')""")
     c.commit()
     return c
 def members(cid):
@@ -156,44 +172,35 @@ def reset_timer(c,cid,media_id,title):
     c.execute("UPDATE polls SET state='open' WHERE collection_id=? AND media_id=?",(cid,media_id))
     c.commit()
 
-def recover_closed_poll(rec):
-    # Telegram has no getMessage endpoint. Editing our own poll's inline markup
-    # returns the Message, including its current Poll; restore the empty markup.
-    # All companion polls are published without an inline keyboard.
-    msg, poll_id = rec[3], rec[4]
-    try:
-        message = tg("editMessageReplyMarkup", {
-            "chat_id": CHAT, "message_id": msg,
-            "reply_markup": {"inline_keyboard": [[{
-                "text": "🗳️", "callback_data": f"companion:recover:{time.time_ns()}"
-            }]]}})
-    finally:
-        try:
-            tg("editMessageReplyMarkup", {
-                "chat_id": CHAT, "message_id": msg,
-                "reply_markup": {"inline_keyboard": []}})
-        except Exception as exc:
-            logging.warning("Could not restore poll markup for message %s: %s", msg, exc)
-    result = message.get("poll", {})
-    if result.get("id") != poll_id or result.get("is_closed") is not True:
-        raise RuntimeError(f"Cannot recover {rec[2]}: matching closed poll not confirmed")
-    logging.info("Recovered already-closed poll for %s", rec[2])
-    return result
+class PollClosureUnverified(RuntimeError):
+    pass
+
+def mark_closure_unverified(c, rec, reason):
+    c.execute("INSERT OR IGNORE INTO poll_closure_reviews VALUES (?,?,?,?)",
+              (rec[4], rec[9], reason, iso(now())))
+    c.execute("UPDATE polls SET state='closure_unverified' WHERE collection_id=? AND media_id=?",
+              (rec[0], rec[1]))
+    c.commit()
 
 def final_poll(c, rec):
-    cached = c.execute("SELECT payload,recorded_at FROM closed_poll_results WHERE poll_id=?",
+    cached = c.execute("SELECT payload,recorded_at,source FROM closed_poll_results WHERE poll_id=?",
                        (rec[4],)).fetchone()
-    if cached:
+    acknowledged = cached is not None and cached[2] == "stopPoll"
+    if acknowledged:
         result, closed_at = json.loads(cached[0]), parse(cached[1])
     else:
         try:
             result = tg("stopPoll", {"chat_id": CHAT, "message_id": rec[3]})
         except TelegramAPIError as exc:
             reason = exc.description.lower().removeprefix("bad request: ")
-            if exc.code != 400 or reason not in (
+            if exc.code == 400 and reason in (
                     "poll can't be stopped", "poll has already been closed"):
-                raise
-            result = recover_closed_poll(rec)
+                mark_closure_unverified(c, rec, exc.description)
+                raise PollClosureUnverified(
+                    f"Closure unverified for {rec[2]}: no successful stopPoll response. "
+                    "Telegram's cached closed flag cannot confirm closure; no outcome applied."
+                ) from None
+            raise
         closed_at = now()
     if result.get("id") != rec[4] or result.get("is_closed") is not True:
         raise RuntimeError(f"Final poll identity or closed state not confirmed: {rec[2]}")
@@ -201,18 +208,21 @@ def final_poll(c, rec):
     if len(options) not in (2, 3) or any(
             type(o.get("voter_count")) is not int or o["voter_count"] < 0 for o in options):
         raise RuntimeError("Unexpected poll choices or counts: " + rec[2])
-    if not cached:
-        # Persist before applying votes so a retry never needs to stop it again.
-        c.execute("INSERT INTO closed_poll_results VALUES (?,?,?)",
-                  (rec[4], json.dumps(result), iso(closed_at)))
+    if not acknowledged:
+        # Only an acknowledged stop, never a message edit, can produce this cache.
+        c.execute("""INSERT INTO closed_poll_results(poll_id,payload,recorded_at,source)
+            VALUES (?,?,?,'stopPoll') ON CONFLICT(poll_id) DO UPDATE SET
+            payload=excluded.payload,recorded_at=excluded.recorded_at,source=excluded.source""",
+            (rec[4], json.dumps(result), iso(closed_at)))
         c.commit()
     return result, closed_at
 
-def close_due(c,rec,min_age_days=POLL_DAYS):
+def close_due(c,rec,min_age_days=POLL_DAYS,*,retry_unverified=False):
     cid,media_id,title,msg,_,opened,_,_,_,state=rec[:10]
     if min_age_days < 0:
         raise ValueError("min_age_days must be nonnegative")
-    if state!="open" or now()<parse(opened)+timedelta(days=min_age_days):return
+    eligible_state = state == "open" or (retry_unverified and state == "closure_unverified")
+    if not eligible_state or now()<parse(opened)+timedelta(days=min_age_days):return
     result, closed_at = final_poll(c, rec)
     options = result["options"]
     kept=int(options[0]["voter_count"])
@@ -236,6 +246,9 @@ def sync():
     c=database()
     collections=check_collections()
     existing={(r[0],r[1]):r for r in c.execute("SELECT * FROM polls").fetchall()}
+    held = sum(rec[9] == "closure_unverified" for rec in existing.values())
+    if held:
+        logging.warning("%s poll outcomes held for closure review; existing protections retained", held)
     # Always reconcile historical results, even for media no longer in a collection.
     for rec in existing.values():
         try:

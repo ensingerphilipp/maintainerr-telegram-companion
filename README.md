@@ -157,27 +157,37 @@ docker compose run --rm -T maintainerr-telegram-polls python close_polls.py --da
 - The 60-day postponement period begins when the poll **actually closes**, including an early close.
 - Closing a poll changes Telegram and Maintainerr state; it does **not** delete media directly.
 
-### Recovery of already-closed polls
+### Acknowledged closure and review holds
 
-If Telegram reports that a poll cannot be stopped or is already closed, the companion checks the original message and accepts results only when its poll ID matches the database and Telegram confirms it is closed. It never interprets a failed request as zero votes. Deleted, inaccessible, mismatched, or still-open polls remain errors for manual investigation.
+Only a successful `stopPoll` response can authorize a final voting outcome. The companion validates the poll ID, closed state, and vote counts, then saves that response with `source=stopPoll` before applying votes. A retry can reuse that acknowledged result if a later database or Maintainerr step fails.
 
-Telegram has no general Bot API method to fetch an existing group message. Recovery briefly adds a 🗳️ inline button to the companion's poll and removes it immediately; the edit response supplies the current poll and final counts. Companion polls have no inline keyboard normally. If removal fails, a warning identifies the message; its verified voting result is still processed.
+Telegram's Bot API uses TDLib, which can mark a poll closed in its cache before the underlying stop succeeds. A subsequent "poll can't be stopped" or "poll has already been closed" error, or `is_closed=true` obtained by editing message markup, does not independently prove that voting has stopped on Telegram. The companion no longer uses markup edits to recover final results. These ambiguous errors place the poll in `closure_unverified` without applying a new outcome.
 
-Final results are saved in SQLite before applying votes, so retries reuse those results without stopping the poll again. For recovered polls whose original closing time is unavailable, the 60-day postponement starts when the final results are first recovered. A recovery does not change the normal closing schedule.
+On upgrade, older cached results without acknowledged-response provenance are retained for audit and marked unverified. Their poll records enter a review hold. Recorded counts, previous state, and exclusion ownership remain available, and existing Maintainerr exclusions are not removed. The scheduler skips these holds, including temporary-exclusion expiry; default manual runs also skip them.
+
+An operator can explicitly preview attempts to close the held polls:
+
+```bash
+docker compose run --rm -T maintainerr-telegram-polls python close_polls.py --days 0 --retry-unverified
+```
+
+Adding `--execute` attempts real closures, including polls still accepting votes. An ambiguous error remains a hold. This option does not clear Telegram's server-side cache and may still require investigation or independent closure verification. Existing protections from earlier unverified outcomes remain in place and require separate review, even after a later voting result changes.
+
+**A review hold does not pause Maintainerr's independent deletion timer.** Keep the deletion safety requirements below in place while investigating. Do not reset the database or substitute cached counts for acknowledged final results.
 
 ### Telegram rate limits
 
 Both the scheduled bot and manual CLI use the same Telegram request handler. On HTTP 429 or a JSON response with error code 429, it waits for Telegram's `parameters.retry_after` seconds plus a one-second buffer, then retries the identical request. Without a valid retry delay it uses exponential backoff (5, 10, 20, 40, then 60 seconds). Each request permits five retries; exhaustion leaves its error visible and an unprocessed poll available for a later attempt. Long waits are logged and split into at most 60-second sleeps.
 
-Ambiguous network timeouts are not blindly retried: a timed-out `sendPoll` or `sendPhoto` may already have succeeded. A later poll-close retry can recover an already-closed poll using the verified recovery described above.
+Ambiguous network timeouts are not blindly retried: a timed-out `sendPoll` or `sendPhoto` may already have succeeded. A later close retry requires an acknowledged stop response; ambiguous cached-closure errors become review holds.
 
 ### When Telegram considers a poll closed
 
-Telegram's `Poll.is_closed` flag means the poll no longer accepts votes. An HTTP 400 response alone does not establish that state; recovery checks the actual poll object.
+A server-confirmed closed poll no longer accepts votes. A Bot API `Poll.is_closed` flag may instead reflect an optimistic TDLib cache after a failed stop; neither that cached flag nor an HTTP 400 error authorizes a final outcome.
 
 Telegram can automatically close a poll if its creator specifies `open_period` or `close_date`. It can also be explicitly stopped through an authorized UI/API action, and the Bot API can create an immediately closed preview using `is_closed=true`. The companion sets none of those creation parameters: `POLL_DAYS` is its own scheduling threshold, followed by a `stopPoll` request.
 
-The companion has no vote-count or all-members-voted closing rule. Telegram's documented automatic closing controls are the optional duration/deadline parameters; a greyed-out voting UI for an individual user is not sufficient evidence of a globally closed poll. The Bot API poll object has no field identifying who stopped a poll or the actual time of an unscheduled closure, so recovered counts alone cannot establish its historical cause.
+The companion has no vote-count or all-members-voted closing rule. Telegram's documented automatic closing controls are the optional duration/deadline parameters; a greyed-out voting UI for an individual user is not sufficient evidence of a globally closed poll. The Bot API poll object has no field identifying who stopped a poll or the actual time of an unscheduled closure, so cached counts alone cannot establish its historical cause. TDLib may also omit timer fields once it considers a poll closed; their absence in a closed snapshot does not prove that no timer was originally set.
 
 References: [Telegram Poll](https://core.telegram.org/bots/api#poll), [sendPoll](https://core.telegram.org/bots/api#sendpoll), [stopPoll](https://core.telegram.org/bots/api#stoppoll), [Telegram poll protocol](https://core.telegram.org/api/poll).
 
