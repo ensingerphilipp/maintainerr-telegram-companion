@@ -42,10 +42,18 @@ def save_votes(db, row, keep, snooze, ok, now, iso):
     db.commit()
     return state
 
+class MissingMetadataError(RuntimeError):
+    """Maintainerr explicitly confirms that this media ID has no metadata."""
+
 def apply_exclusion(maintain, cid, media_id):
     result = maintain("/api/rules/exclusions/bulk", {
         "collectionId": cid, "mediaIds": [media_id], "action": 0})
     outcomes = result.get("results", [])
+    if len(outcomes) == 1:
+        item = outcomes[0]
+        if (item.get("code") == 0 and str(item.get("mediaId")) == str(media_id)
+                and str(item.get("message", "")).strip().lower() == "failed - no metadata"):
+            raise MissingMetadataError(f"Maintainerr has no metadata for media_id={media_id}")
     if len(outcomes) != 1 or outcomes[0].get("code") != 1:
         raise RuntimeError("Exclusion failed: "+str(result))
 

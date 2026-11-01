@@ -26,7 +26,13 @@ def main(argv=None):
     with bot.execution_lock():
         db=bot.database()
         try:
+            initial_count=db.execute("SELECT count(*) FROM polls").fetchone()[0]
+            metadata_failures=bot.refresh_poll_metadata(db) if args.execute else set()
             records=db.execute("SELECT * FROM polls ORDER BY opened_at").fetchall()
+            stale_count=sum(row[9]=="stale" for row in records)
+            archived_count=initial_count-len(records)
+            if stale_count or archived_count:
+                print(f"Stale metadata: {stale_count} ignored, {archived_count} archived.",flush=True)
             held = sum(row[9] == "closure_unverified" for row in records)
             if held:
                 print(f"Closure review: {held} unverified polls. A real close retry requires --retry-unverified --execute.",flush=True)
@@ -38,19 +44,31 @@ def main(argv=None):
             if not args.execute:
                 print("No Telegram or Maintainerr changes. Add --execute to close and evaluate these polls.",flush=True)
                 return 0
-            failed=0
+            failed=len(metadata_failures)
+            processed=0
+            ignored=stale_count+archived_count
             for row in matches:
+                if (row[0],row[1]) in metadata_failures:
+                    continue
                 try:
-                    bot.close_due(db,row,min_age_days=args.days,retry_unverified=args.retry_unverified)
-                    status=db.execute("SELECT state FROM polls WHERE collection_id=? AND media_id=?",(row[0],row[1])).fetchone()[0]
-                    print(f"DONE: {row[2]!r} -> {status}",flush=True)
+                    bot.close_due(db,row,min_age_days=args.days,retry_unverified=args.retry_unverified,
+                                  metadata_checked=True)
+                    found=db.execute("SELECT state FROM polls WHERE collection_id=? AND media_id=?",
+                                     (row[0],row[1])).fetchone()
+                    status=found[0] if found else "archived_stale"
+                    if status in ("stale","archived_stale"):
+                        ignored+=1
+                        print(f"IGNORED: {row[2]!r} -> {status}",flush=True)
+                    else:
+                        processed+=1
+                        print(f"DONE: {row[2]!r} -> {status}",flush=True)
                 except Exception:
                     failed+=1
                     logging.exception("FAILED title=%r collection_id=%s media_id=%s poll_id=%s "
                                       "chat_id=%s message_id=%s state_before=%s",
                                       row[2],row[0],row[1],row[4],bot.redact_diagnostic(bot.CHAT),
                                       row[3],row[9])
-            print(f"Finished: {len(matches)-failed} processed, {failed} failed",flush=True)
+            print(f"Finished: {processed} processed, {ignored} ignored as stale, {failed} failed",flush=True)
             return 1 if failed else 0
         finally:
             db.close()

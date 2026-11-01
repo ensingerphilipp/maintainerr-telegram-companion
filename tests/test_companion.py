@@ -10,6 +10,8 @@ import bot
 import close_polls
 import covers
 
+real_metadata_exists = bot.metadata_exists
+
 
 class PollTests(unittest.TestCase):
     def setUp(self):
@@ -21,6 +23,9 @@ class PollTests(unittest.TestCase):
         self.addCleanup(self.db_patcher.stop)
         self.db = bot.database()
         self.addCleanup(self.db.close)
+        self.metadata_patcher = patch.object(bot, "metadata_exists", return_value=True)
+        self.metadata_patcher.start()
+        self.addCleanup(self.metadata_patcher.stop)
 
     def insert(self, mid, days_old=3):
         self.db.execute(
@@ -434,6 +439,168 @@ class PollTests(unittest.TestCase):
         self.assertIn("http_status=502", text)
         self.assertIn("upstream failed [redacted]", text)
         self.assertNotIn("SECRET", text)
+
+    def test_missing_metadata_skips_telegram_and_marks_young_poll_stale(self):
+        rec = self.insert("1")
+        with patch.object(bot, "metadata_exists", return_value=False), \
+             patch.object(bot, "tg") as telegram, patch.object(bot, "maintain") as maintain, \
+             self.assertLogs(level="WARNING") as logs:
+            bot.close_due(self.db, rec, min_age_days=0)
+        telegram.assert_not_called()
+        maintain.assert_not_called()
+        state, previous, since = self.db.execute(
+            "SELECT state,stale_previous_state,stale_since FROM polls").fetchone()
+        self.assertEqual((state, previous), ("stale", "open"))
+        self.assertIsNotNone(since)
+        self.assertIn("event=stale_poll_marked", "\n".join(logs.output))
+
+    def test_stale_poll_archives_at_29_days_with_votes_and_ownership_intact(self):
+        import json
+        fixed = bot.now()
+        with patch.object(bot, "now", return_value=fixed):
+            rec = self.insert("1", days_old=29)
+            self.db.execute("UPDATE polls SET keep_votes=2,owned_exclusion_ids='[77]'")
+            self.db.commit()
+            with patch.object(bot, "metadata_exists", return_value=False), \
+                 patch.object(bot, "tg") as telegram, patch.object(bot, "maintain") as maintain:
+                self.assertEqual(bot.refresh_poll_metadata(self.db), set())
+        telegram.assert_not_called()
+        maintain.assert_not_called()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM polls").fetchone()[0], 0)
+        saved = self.db.execute("SELECT poll_id,payload,reason FROM stale_poll_archive").fetchone()
+        self.assertEqual(saved[0], rec[4])
+        payload = json.loads(saved[1])
+        self.assertEqual(payload["keep_votes"], 2)
+        self.assertEqual(payload["owned_exclusion_ids"], "[77]")
+        self.assertEqual(payload["message_id"], 1)
+        self.assertEqual(payload["stale_previous_state"], "open")
+        self.assertIn("no metadata", saved[2])
+
+    def test_stale_poll_is_retained_before_29_day_boundary(self):
+        fixed = bot.now()
+        with patch.object(bot, "now", return_value=fixed):
+            self.insert("1", days_old=29 - 1/86400)
+            with patch.object(bot, "metadata_exists", return_value=False):
+                bot.refresh_poll_metadata(self.db)
+        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "stale")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM stale_poll_archive").fetchone()[0], 0)
+
+    def test_returned_metadata_restores_pending_state_even_after_age_boundary(self):
+        self.insert("1")
+        self.db.execute("UPDATE polls SET state='veto_pending'")
+        self.db.commit()
+        with patch.object(bot, "metadata_exists", return_value=False):
+            bot.refresh_poll_metadata(self.db)
+        self.db.execute("UPDATE polls SET opened_at=?", (bot.iso(bot.now()-timedelta(days=30)),))
+        self.db.commit()
+        with patch.object(bot, "metadata_exists", return_value=True):
+            bot.refresh_poll_metadata(self.db)
+        self.assertEqual(self.db.execute(
+            "SELECT state,stale_since,stale_reason,stale_previous_state FROM polls").fetchone(),
+            ("veto_pending", None, None, None))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM stale_poll_archive").fetchone()[0], 0)
+
+    def test_metadata_outage_does_not_archive_old_stale_poll(self):
+        self.insert("1")
+        with patch.object(bot, "metadata_exists", return_value=False):
+            bot.refresh_poll_metadata(self.db)
+        self.db.execute("UPDATE polls SET opened_at=?", (bot.iso(bot.now()-timedelta(days=30)),))
+        self.db.commit()
+        with patch.object(bot, "metadata_exists", side_effect=RuntimeError("HTTP 503")), \
+             self.assertLogs(level="ERROR"):
+            failed = bot.refresh_poll_metadata(self.db)
+        self.assertEqual(failed, {(1, "1")})
+        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "stale")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM stale_poll_archive").fetchone()[0], 0)
+
+    def test_metadata_shape_checks_accept_only_confirmed_missing_or_matching_item(self):
+        for response, expected in ((None, False), ({}, False), ({"id": "1"}, True)):
+            with self.subTest(response=response), patch.object(bot, "maintain", return_value=response):
+                self.assertEqual(real_metadata_exists("1"), expected)
+        for response in ([], {"message": "unavailable"}, {"id": "different"}):
+            with self.subTest(response=response), patch.object(bot, "maintain", return_value=response):
+                with self.assertRaisesRegex(RuntimeError, "Invalid metadata response"):
+                    real_metadata_exists("1")
+
+    def test_metadata_http_failure_remains_an_error(self):
+        import io
+        import urllib.error
+        error = urllib.error.HTTPError("https://example.invalid", 503, "Unavailable",
+                                       {}, io.BytesIO(b"unavailable"))
+        self.addCleanup(error.close)
+        with patch.object(bot, "maintain", side_effect=error):
+            with self.assertRaises(urllib.error.HTTPError):
+                real_metadata_exists("1")
+
+    def test_unverified_cache_migration_does_not_erase_stale_classification(self):
+        self.insert("1")
+        self.db.execute("INSERT INTO closed_poll_results VALUES (?,?,?,'unverified')",
+                        ("poll-1", "{}", bot.iso(bot.now())))
+        self.db.commit()
+        with patch.object(bot, "metadata_exists", return_value=False):
+            bot.refresh_poll_metadata(self.db)
+        upgraded = bot.database()
+        upgraded.close()
+        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "stale")
+
+    def test_bulk_missing_metadata_error_requires_matching_media_and_exact_reason(self):
+        response = {"results": [{"mediaId": "1", "code": 0, "message": "Failed - no metadata"}]}
+        with self.assertRaises(bot.voting.MissingMetadataError):
+            bot.voting.apply_exclusion(lambda *a, **k: response, 1, "1")
+        for media_id, message in (("other", "Failed - no metadata"), ("1", "Metadata provider unavailable")):
+            response = {"results": [{"mediaId": media_id, "code": 0, "message": message}]}
+            try:
+                bot.voting.apply_exclusion(lambda *a, **k: response, 1, "1")
+            except RuntimeError as exc:
+                self.assertNotIsInstance(exc, bot.voting.MissingMetadataError)
+            else:
+                self.fail("Expected a real exclusion error")
+
+    def test_metadata_disappearing_during_veto_is_ignored_as_stale(self):
+        rec = self.insert("1")
+        with patch.object(bot, "tg", return_value=self.closed_poll(keep=2)), \
+             patch.object(bot.voting, "permanent_veto",
+                          side_effect=bot.voting.MissingMetadataError("no metadata")):
+            bot.close_due(self.db, rec, min_age_days=0)
+        self.assertEqual(self.db.execute(
+            "SELECT state,stale_previous_state,keep_votes FROM polls").fetchone(),
+            ("stale", "veto_pending", 2))
+
+    def test_other_exclusion_failures_are_not_silently_ignored(self):
+        rec = self.insert("1")
+        with patch.object(bot, "tg", return_value=self.closed_poll(keep=2)), \
+             patch.object(bot.voting, "permanent_veto", side_effect=RuntimeError("permission denied")):
+            with self.assertRaisesRegex(RuntimeError, "permission denied"):
+                bot.close_due(self.db, rec, min_age_days=0)
+        self.assertEqual(self.db.execute("SELECT state FROM polls").fetchone()[0], "veto_pending")
+
+    def test_manual_cli_ignores_stale_without_counting_failure(self):
+        from contextlib import nullcontext, redirect_stdout
+        import io
+        self.insert("1")
+        output = io.StringIO()
+        with patch.object(bot, "metadata_exists", return_value=False), \
+             patch.object(bot, "tg") as telegram, \
+             patch.object(bot, "TOKEN", "test-token"), patch.object(bot, "CHAT", "test-chat"), \
+             patch.object(bot, "execution_lock", return_value=nullcontext()), redirect_stdout(output):
+            code = close_polls.main(["--days", "0", "--execute"])
+        self.assertEqual(code, 0)
+        self.assertIn("1 ignored as stale, 0 failed", output.getvalue())
+        telegram.assert_not_called()
+
+    def test_archived_missing_item_is_not_republished_from_stale_collection_data(self):
+        self.insert("1", days_old=30)
+        item = {"mediaServerId": "1", "mediaData": {"title": "Sample 1", "type": "movie"}}
+        with patch.object(bot, "metadata_exists", return_value=False), \
+             patch.object(bot, "TOKEN", "test-token"), patch.object(bot, "CHAT", "test-chat"), \
+             patch.object(bot, "ENABLED", True), patch.object(bot, "IDS", [1]), \
+             patch.object(bot, "check_collections", return_value={}), \
+             patch.object(bot.covers, "backfill"), patch.object(bot, "members", return_value=[item]), \
+             patch.object(bot, "publish") as publish:
+            bot.sync()
+        publish.assert_not_called()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM polls").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM stale_poll_archive").fetchone()[0], 1)
 
     def test_cover_url_is_strict(self):
         self.assertEqual(

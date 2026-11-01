@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Maintainerr-owned cleanup; Telegram voting companion (no delete endpoints)."""
-import json, os, re, sqlite3, time, urllib.request, urllib.error, logging, fcntl
+import json, os, re, sqlite3, time, urllib.request, urllib.error, urllib.parse, logging, fcntl
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -18,6 +18,7 @@ POLL_DAYS=int(os.getenv("POLL_DAYS","29"))
 RETENTION_DAYS=int(os.getenv("RETENTION_DAYS","45"))
 if not 1 <= POLL_DAYS < RETENTION_DAYS:
     raise ValueError("Require 1 <= POLL_DAYS < RETENTION_DAYS")
+STALE_POLL_DAYS=29
 MAX_NEW_POLLS_PER_CYCLE=int(os.getenv("MAX_NEW_POLLS_PER_CYCLE","5"))
 ENABLED=os.getenv("PUBLISH_POLLS","false").lower()=="true"
 @contextmanager
@@ -174,10 +175,99 @@ def database():
         SELECT p.poll_id,p.state,?,? FROM polls p JOIN closed_poll_results r
         ON r.poll_id=p.poll_id WHERE r.source!='stopPoll'""",
         ("Legacy result has no acknowledged stopPoll response", iso(now())))
-    c.execute("""UPDATE polls SET state='closure_unverified' WHERE poll_id IN
+    c.execute("""UPDATE polls SET state='closure_unverified' WHERE state!='stale' AND poll_id IN
         (SELECT poll_id FROM closed_poll_results WHERE source!='stopPoll')""")
+    fields = {r[1] for r in c.execute("PRAGMA table_info(polls)")}
+    for name in ("stale_since", "stale_reason", "stale_previous_state"):
+        if name not in fields:
+            c.execute(f"ALTER TABLE polls ADD COLUMN {name} TEXT")
+    c.execute("""CREATE TABLE IF NOT EXISTS stale_poll_archive(
+        poll_id TEXT PRIMARY KEY, collection_id INTEGER NOT NULL, media_id TEXT NOT NULL,
+        title TEXT NOT NULL, payload TEXT NOT NULL, stale_since TEXT NOT NULL,
+        reason TEXT NOT NULL, archived_at TEXT NOT NULL)""")
     c.commit()
     return c
+def metadata_exists(media_id):
+    path = "/api/media-server/meta/" + urllib.parse.quote(str(media_id), safe="")
+    metadata = maintain(path)
+    if metadata is None or metadata == {}:
+        return False
+    if not isinstance(metadata, dict) or str(metadata.get("id")) != str(media_id):
+        raise RuntimeError(f"Invalid metadata response for media_id={media_id}: "
+                           + diagnostic_json(metadata))
+    return True
+
+def mark_stale(c, rec, reason):
+    current = c.execute("SELECT * FROM polls WHERE collection_id=? AND media_id=?",
+                        (rec[0], rec[1])).fetchone()
+    if current is None:
+        return
+    first = current[9] != "stale"
+    c.execute("""UPDATE polls SET
+        stale_previous_state=CASE WHEN state!='stale' THEN state ELSE stale_previous_state END,
+        stale_since=COALESCE(stale_since,?),stale_reason=?,state='stale'
+        WHERE collection_id=? AND media_id=?""",
+        (iso(now()), reason, rec[0], rec[1]))
+    c.commit()
+    if first:
+        logging.warning("event=stale_poll_marked title=%r collection_id=%s media_id=%s "
+                        "poll_id=%s message_id=%s prior_state=%s reason=%r archive_after=%s",
+                        rec[2],rec[0],rec[1],rec[4],rec[3],current[9],reason,
+                        iso(parse(rec[5]) + timedelta(days=STALE_POLL_DAYS)))
+    else:
+        logging.info("event=stale_poll_ignored title=%r collection_id=%s media_id=%s "
+                     "poll_id=%s reason=%r archive_after=%s",rec[2],rec[0],rec[1],rec[4],
+                     reason,iso(parse(rec[5]) + timedelta(days=STALE_POLL_DAYS)))
+    if now() < parse(rec[5]) + timedelta(days=STALE_POLL_DAYS):
+        return
+    cursor = c.execute("SELECT * FROM polls WHERE collection_id=? AND media_id=?",
+                       (rec[0], rec[1]))
+    row = cursor.fetchone()
+    snapshot = dict(zip((column[0] for column in cursor.description), row))
+    # Preserve all vote, message, and exclusion ownership data before removal.
+    with c:
+        c.execute("""INSERT OR IGNORE INTO stale_poll_archive
+            (poll_id,collection_id,media_id,title,payload,stale_since,reason,archived_at)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (rec[4],rec[0],rec[1],rec[2],json.dumps(snapshot),
+             snapshot["stale_since"],reason,iso(now())))
+        c.execute("DELETE FROM polls WHERE collection_id=? AND media_id=? AND poll_id=?",
+                  (rec[0],rec[1],rec[4]))
+    logging.info("event=stale_poll_archived title=%r collection_id=%s media_id=%s "
+                 "poll_id=%s age_days=%.2f",rec[2],rec[0],rec[1],rec[4],
+                 (now()-parse(rec[5])).total_seconds()/86400)
+
+def reconcile_poll_metadata(c, rec):
+    if not metadata_exists(rec[1]):
+        mark_stale(c,rec,"Maintainerr metadata endpoint returned no metadata")
+        return None
+    if rec[9] == "stale":
+        previous = c.execute("SELECT stale_previous_state FROM polls "
+                             "WHERE collection_id=? AND media_id=?",(rec[0],rec[1])).fetchone()[0]
+        if not previous or previous == "stale":
+            raise RuntimeError(f"Missing previous state for stale poll {rec[4]}")
+        c.execute("""UPDATE polls SET state=?,stale_since=NULL,stale_reason=NULL,
+            stale_previous_state=NULL WHERE collection_id=? AND media_id=?""",
+            (previous,rec[0],rec[1]))
+        c.commit()
+        logging.info("event=stale_poll_restored title=%r collection_id=%s media_id=%s "
+                     "poll_id=%s restored_state=%s",rec[2],rec[0],rec[1],rec[4],previous)
+        return c.execute("SELECT * FROM polls WHERE collection_id=? AND media_id=?",
+                         (rec[0],rec[1])).fetchone()
+    return rec
+
+def refresh_poll_metadata(c):
+    failed = set()
+    for rec in c.execute("SELECT * FROM polls").fetchall():
+        try:
+            reconcile_poll_metadata(c,rec)
+        except Exception:
+            failed.add((rec[0],rec[1]))
+            logging.exception("Metadata reconciliation failed title=%r collection_id=%s "
+                              "media_id=%s poll_id=%s state=%s",
+                              rec[2],rec[0],rec[1],rec[4],rec[9])
+    return failed
+
 def members(cid):
     page=1;result=[]
     while True:
@@ -281,12 +371,14 @@ def final_poll(c, rec):
                  result.get("is_closed"), [o["voter_count"] for o in options], iso(closed_at))
     return result, closed_at
 
-def close_due(c,rec,min_age_days=POLL_DAYS,*,retry_unverified=False):
+def close_due(c,rec,min_age_days=POLL_DAYS,*,retry_unverified=False,metadata_checked=False):
     cid,media_id,title,msg,_,opened,_,_,_,state=rec[:10]
     if min_age_days < 0:
         raise ValueError("min_age_days must be nonnegative")
     eligible_state = state == "open" or (retry_unverified and state == "closure_unverified")
     if not eligible_state or now()<parse(opened)+timedelta(days=min_age_days):return
+    if not metadata_checked and reconcile_poll_metadata(c,rec) is None:
+        return
     logging.info("event=poll_close_attempt title=%r collection_id=%s media_id=%s "
                  "poll_id=%s chat_id=%s message_id=%s state=%s opened_at=%s min_age_days=%s",
                  title, cid, media_id, rec[4], redact_diagnostic(CHAT), msg, state,
@@ -298,8 +390,11 @@ def close_due(c,rec,min_age_days=POLL_DAYS,*,retry_unverified=False):
     deleted=int(options[-1]["voter_count"])
     outcome=voting.save_votes(c,rec,kept,snooze,deleted,lambda: closed_at,iso)
     logging.info("Closed %s: veto=%d snooze=%d okay=%d => %s",title,kept,snooze,deleted,outcome)
-    if kept:voting.permanent_veto(c,rec,maintain)
-    elif snooze:voting.start_snooze(c,rec,maintain)
+    try:
+        if kept:voting.permanent_veto(c,rec,maintain)
+        elif snooze:voting.start_snooze(c,rec,maintain)
+    except voting.MissingMetadataError as exc:
+        mark_stale(c,rec,str(exc))
 def exclude(c,cid,media_id,title):
     response=maintain("/api/rules/exclusions/bulk",{"collectionId":cid,"mediaIds":[media_id],"action":0})
     if not response.get("results") or any(x.get("code")!=1 for x in response["results"]):
@@ -313,18 +408,23 @@ def sync():
         return
     c=database()
     collections=check_collections()
+    metadata_failures=refresh_poll_metadata(c)
     existing={(r[0],r[1]):r for r in c.execute("SELECT * FROM polls").fetchall()}
     held = sum(rec[9] == "closure_unverified" for rec in existing.values())
     if held:
         logging.warning("%s poll outcomes held for closure review; existing protections retained", held)
     # Always reconcile historical results, even for media no longer in a collection.
     for rec in existing.values():
+        if (rec[0],rec[1]) in metadata_failures:
+            continue
         try:
-            if rec[9]=="open":close_due(c,rec)
+            if rec[9]=="open":close_due(c,rec,metadata_checked=True)
             elif rec[9]=="veto_pending":voting.permanent_veto(c,rec,maintain)
             elif rec[9]=="snooze_pending":voting.start_snooze(c,rec,maintain)
             elif rec[9]=="snoozed":voting.finish_snooze(c,rec,maintain,now,parse)
             elif rec[9]=="timer_pending":reset_timer(c,rec[0],rec[1],rec[2])
+        except voting.MissingMetadataError as exc:
+            mark_stale(c,rec,str(exc))
         except Exception:
             logging.exception("Poll reconciliation failure title=%r collection_id=%s media_id=%s "
                               "poll_id=%s message_id=%s state=%s",
@@ -337,6 +437,10 @@ def sync():
             previous=existing.get(key)
             if (previous is None or previous[9]=="awaiting_reentry") and ENABLED and created<MAX_NEW_POLLS_PER_CYCLE:
                 try:
+                    if not metadata_exists(item["mediaServerId"]):
+                        logging.warning("event=poll_publication_skipped collection_id=%s media_id=%s "
+                                        "reason=missing_metadata",cid,item["mediaServerId"])
+                        continue
                     if previous is not None:
                         c.execute("INSERT INTO poll_history VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (previous[0],previous[1],previous[2],previous[3],previous[4],previous[5],

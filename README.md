@@ -181,6 +181,14 @@ Both the scheduled bot and manual CLI use the same Telegram request handler. On 
 
 Ambiguous network timeouts are not blindly retried: a timed-out `sendPoll` or `sendPhoto` may already have succeeded. A later close retry requires an acknowledged stop response; ambiguous cached-closure errors become review holds.
 
+### Stale polls with missing Maintainerr metadata
+
+A confirmed empty response from `/api/media-server/meta/{media_id}`, or Maintainerr's explicit `Failed - no metadata` result for that media ID, marks the poll `stale`. The bot logs the title, collection/media/poll/message IDs, reason, and cleanup deadline. Stale polls are ignored for closure and outcome processing, including retries of exclusions. The manual CLI counts them as ignored rather than failed.
+
+The scheduler checks whether metadata has returned. If it has, the saved previous state is restored. If metadata is still absent once the poll reaches **29 days after publication**, the full record is copied to `stale_poll_archive` and removed from the active `polls` table. Archived data retains votes, message IDs, and exclusion ownership. Telegram posts and existing Maintainerr exclusions are left in place. A stale collection entry cannot cause republication while its media ID still lacks metadata.
+
+HTTP errors, timeouts, malformed responses, mismatched media IDs, and unrelated exclusion errors remain visible errors. They do not establish that metadata is missing and never authorize archival. A Telegram 400 also does not make a poll stale: it is a separate closure error.
+
 ### Diagnostic logging
 
 At the default INFO level, poll closure attempts include the title, collection/media IDs, Telegram chat/message/poll IDs, prior state, and age threshold. Telegram failures include a correlation ID shared across retries, method, target IDs, attempt number, elapsed time, HTTP status, API error code, exact description, response parameters, retry delay, selected response headers, and the sanitized response body. Non-JSON error bodies are retained as text; diagnostic values are capped at 8192 characters. Network failures identify the exception and report an unknown outcome without blindly repeating a possibly completed send.
