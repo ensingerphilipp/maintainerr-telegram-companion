@@ -36,7 +36,7 @@ def main(argv=None):
                 age=(bot.now()-bot.parse(row[5])).total_seconds()/86400
                 print(f"collection={row[0]} title={row[2]!r} age={age:.2f}d state={row[9]}",flush=True)
             if not args.execute:
-                print("No changes. Add --execute to close and evaluate these polls.",flush=True)
+                print("No Telegram or Maintainerr changes. Add --execute to close and evaluate these polls.",flush=True)
                 return 0
             failed=0
             for row in matches:
@@ -46,7 +46,10 @@ def main(argv=None):
                     print(f"DONE: {row[2]!r} -> {status}",flush=True)
                 except Exception:
                     failed+=1
-                    logging.exception("FAILED: %s",row[2])
+                    logging.exception("FAILED title=%r collection_id=%s media_id=%s poll_id=%s "
+                                      "chat_id=%s message_id=%s state_before=%s",
+                                      row[2],row[0],row[1],row[4],bot.redact_diagnostic(bot.CHAT),
+                                      row[3],row[9])
             print(f"Finished: {len(matches)-failed} processed, {failed} failed",flush=True)
             return 1 if failed else 0
         finally:

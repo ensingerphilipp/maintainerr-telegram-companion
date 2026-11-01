@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Maintainerr-owned cleanup; Telegram voting companion (no delete endpoints)."""
-import json, os, sqlite3, time, urllib.request, urllib.error, logging, fcntl
+import json, os, re, sqlite3, time, urllib.request, urllib.error, logging, fcntl
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -41,53 +41,112 @@ def api(url, body=None, method=None):
         if not r.status in range(200,300):raise RuntimeError(str(result))
         return result
 def maintain(path,body=None,method=None):return api(BASE+path,body,method)
+def redact_diagnostic(value):
+    text = str(value)
+    if TOKEN:
+        text = text.replace(TOKEN, "[redacted]")
+    # Never expose bot credentials embedded in an exception or response URL.
+    return re.sub(r"(https?://api\.telegram\.org/bot)[^/\s\"'<>]+",
+                  r"\1[redacted]", text, flags=re.IGNORECASE)
+
+def diagnostic_json(value):
+    text = redact_diagnostic(json.dumps(value, ensure_ascii=False, default=str))
+    return text if len(text) <= 8192 else text[:8192] + "...[truncated]"
+
+def telegram_target(body):
+    return diagnostic_json({key: body[key] for key in
+                            ("chat_id", "message_id", "poll_id", "from_chat_id") if key in body})
+
 class TelegramAPIError(RuntimeError):
-    def __init__(self, method, code, description, parameters=None):
+    def __init__(self, method, code, description, parameters=None, *,
+                 http_status=None, response=None, response_headers=None):
         self.code = code
+        self.http_status = code if http_status is None else http_status
         self.parameters = parameters if isinstance(parameters, dict) else {}
         retry_after = self.parameters.get("retry_after")
         self.retry_after = retry_after if type(retry_after) is int and retry_after >= 0 else None
-        self.description = str(description).replace(TOKEN, "[redacted]") if TOKEN else str(description)
-        super().__init__(f"Telegram {method}: HTTP {code}: {self.description}")
+        self.description = redact_diagnostic(description)
+        self.api_code = response.get("error_code", code) if isinstance(response, dict) else code
+        self.response_text = diagnostic_json(response)
+        self.headers_text = diagnostic_json(response_headers or {})
+        super().__init__(f"Telegram {method}: HTTP {self.http_status}: {self.description}")
+
+class TelegramTransportError(RuntimeError):
+    pass
 
 def telegram(method,body):
     try:
         return api("https://api.telegram.org/bot"+TOKEN+"/"+method,body)
     except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        headers = {key: exc.headers[key] for key in
+                   ("Date", "Content-Type", "Retry-After", "X-Request-ID", "X-Telegram-Request-ID")
+                   if exc.headers is not None and key in exc.headers}
         try:
-            response = json.loads(exc.read())
+            response = json.loads(raw)
+            if not isinstance(response, dict):
+                raise ValueError("Non-object JSON error")
             description = response.get("description", "No description")
             parameters = response.get("parameters")
         except (ValueError, UnicodeError, AttributeError):
-            description, parameters = "Unreadable HTTP error response", None
+            description, parameters, response = "Unreadable HTTP error response", None, raw
         finally:
             exc.close()
-        raise TelegramAPIError(method, exc.code, description, parameters) from None
+        raise TelegramAPIError(method, exc.code, description, parameters,
+                               http_status=exc.code, response=response,
+                               response_headers=headers) from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        raise TelegramTransportError(
+            f"Telegram {method}: {type(exc).__name__}: {redact_diagnostic(exc)}"
+        ) from None
 
 TELEGRAM_MAX_RETRIES = 5
 
 def tg(method,body):
+    request_id = f"{time.time_ns():x}"
+    target = telegram_target(body)
     for attempt in range(TELEGRAM_MAX_RETRIES + 1):
+        started = time.monotonic()
         try:
             r = telegram(method, body)
             if not r.get("ok"):
                 raise TelegramAPIError(method, r.get("error_code"),
-                                       r.get("description"), r.get("parameters"))
+                                       r.get("description"), r.get("parameters"),
+                                       http_status=200, response=r)
+            elapsed = (time.monotonic() - started) * 1000
+            logging.log(logging.INFO if attempt or method == "stopPoll" else logging.DEBUG,
+                        "event=telegram_request_succeeded request_id=%s method=%s target=%s "
+                        "attempt=%s elapsed_ms=%.1f", request_id, method, target, attempt + 1, elapsed)
             return r["result"]
         except TelegramAPIError as exc:
-            if exc.code != 429 or attempt == TELEGRAM_MAX_RETRIES:
+            retry = exc.code == 429 and attempt < TELEGRAM_MAX_RETRIES
+            delay = (exc.retry_after + 1 if exc.retry_after is not None
+                     else min(5 * 2**attempt, 60)) if retry else None
+            logging.log(logging.WARNING if retry else logging.ERROR,
+                        "event=telegram_request_failed request_id=%s method=%s target=%s "
+                        "attempt=%s/%s elapsed_ms=%.1f http_status=%s error_code=%s "
+                        "description=%r parameters=%s retry_after=%s retry_in=%s "
+                        "will_retry=%s headers=%s response=%s",
+                        request_id, method, target, attempt + 1, TELEGRAM_MAX_RETRIES + 1,
+                        (time.monotonic() - started) * 1000, exc.http_status, exc.api_code,
+                        exc.description, diagnostic_json(exc.parameters), exc.retry_after,
+                        delay, retry, exc.headers_text, exc.response_text)
+            if not retry:
                 raise
-            # Repeat after the advertised delay. stopPoll still requires an
-            # acknowledged success; a later cached 400 must not finalize votes.
-            # Do not retry ambiguous network
-            # timeouts here: sendPoll/sendPhoto could otherwise be duplicated.
-            delay = exc.retry_after + 1 if exc.retry_after is not None else min(5 * 2**attempt, 60)
-            logging.warning("Telegram %s rate limited; retry %s/%s in %ss",
-                            method, attempt + 1, TELEGRAM_MAX_RETRIES, delay)
+            # No outcomes follow an ambiguous cached 400 after a rate limit.
             while delay > 0:
                 chunk = min(delay, 60)
                 time.sleep(chunk)
                 delay -= chunk
+        except (TelegramTransportError, urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            logging.error("event=telegram_transport_failed request_id=%s method=%s target=%s "
+                          "attempt=%s elapsed_ms=%.1f exception_type=%s reason=%r "
+                          "will_retry=False outcome=unknown",
+                          request_id, method, target, attempt + 1,
+                          (time.monotonic() - started) * 1000, type(exc).__name__,
+                          redact_diagnostic(exc))
+            raise
+
 def database():
     c=sqlite3.connect(DB)
     c.execute("PRAGMA journal_mode=WAL")
@@ -198,6 +257,7 @@ def final_poll(c, rec):
                 mark_closure_unverified(c, rec, exc.description)
                 raise PollClosureUnverified(
                     f"Closure unverified for {rec[2]}: no successful stopPoll response. "
+                    f"Telegram reason: {exc.description}. "
                     "Telegram's cached closed flag cannot confirm closure; no outcome applied."
                 ) from None
             raise
@@ -215,6 +275,10 @@ def final_poll(c, rec):
             payload=excluded.payload,recorded_at=excluded.recorded_at,source=excluded.source""",
             (rec[4], json.dumps(result), iso(closed_at)))
         c.commit()
+    logging.info("event=poll_close_result collection_id=%s media_id=%s poll_id=%s "
+                 "message_id=%s source=%s is_closed=%s counts=%s recorded_at=%s",
+                 rec[0], rec[1], rec[4], rec[3], "acknowledged_cache" if acknowledged else "stopPoll",
+                 result.get("is_closed"), [o["voter_count"] for o in options], iso(closed_at))
     return result, closed_at
 
 def close_due(c,rec,min_age_days=POLL_DAYS,*,retry_unverified=False):
@@ -223,6 +287,10 @@ def close_due(c,rec,min_age_days=POLL_DAYS,*,retry_unverified=False):
         raise ValueError("min_age_days must be nonnegative")
     eligible_state = state == "open" or (retry_unverified and state == "closure_unverified")
     if not eligible_state or now()<parse(opened)+timedelta(days=min_age_days):return
+    logging.info("event=poll_close_attempt title=%r collection_id=%s media_id=%s "
+                 "poll_id=%s chat_id=%s message_id=%s state=%s opened_at=%s min_age_days=%s",
+                 title, cid, media_id, rec[4], redact_diagnostic(CHAT), msg, state,
+                 opened, min_age_days)
     result, closed_at = final_poll(c, rec)
     options = result["options"]
     kept=int(options[0]["voter_count"])
@@ -258,7 +326,9 @@ def sync():
             elif rec[9]=="snoozed":voting.finish_snooze(c,rec,maintain,now,parse)
             elif rec[9]=="timer_pending":reset_timer(c,rec[0],rec[1],rec[2])
         except Exception:
-            logging.exception("Poll reconciliation failure for %s",rec[2])
+            logging.exception("Poll reconciliation failure title=%r collection_id=%s media_id=%s "
+                              "poll_id=%s message_id=%s state=%s",
+                              rec[2],rec[0],rec[1],rec[4],rec[3],rec[9])
     covers.backfill(c,IDS,members,tg,CHAT,limit=2)
     created=0
     for cid in IDS:

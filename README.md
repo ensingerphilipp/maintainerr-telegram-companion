@@ -181,6 +181,12 @@ Both the scheduled bot and manual CLI use the same Telegram request handler. On 
 
 Ambiguous network timeouts are not blindly retried: a timed-out `sendPoll` or `sendPhoto` may already have succeeded. A later close retry requires an acknowledged stop response; ambiguous cached-closure errors become review holds.
 
+### Diagnostic logging
+
+At the default INFO level, poll closure attempts include the title, collection/media IDs, Telegram chat/message/poll IDs, prior state, and age threshold. Telegram failures include a correlation ID shared across retries, method, target IDs, attempt number, elapsed time, HTTP status, API error code, exact description, response parameters, retry delay, selected response headers, and the sanitized response body. Non-JSON error bodies are retained as text; diagnostic values are capped at 8192 characters. Network failures identify the exception and report an unknown outcome without blindly repeating a possibly completed send.
+
+Successful stop responses log their source, poll ID, closed flag, and final option counts. Both the scheduler and CLI attach poll identifiers to their exception tracebacks. Bot tokens and credential-bearing Telegram URLs are redacted; complete request payloads are not logged. The CLI writes diagnostics to stderr, so capture both stdout and stderr when saving a run. Scheduled diagnostics are available through `docker compose logs maintainerr-telegram-polls`.
+
 ### When Telegram considers a poll closed
 
 A server-confirmed closed poll no longer accepts votes. A Bot API `Poll.is_closed` flag may instead reflect an optimistic TDLib cache after a failed stop; neither that cached flag nor an HTTP 400 error authorizes a final outcome.

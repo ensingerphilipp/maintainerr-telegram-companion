@@ -363,6 +363,78 @@ class PollTests(unittest.TestCase):
                         bot.close_due(self.db, rec, min_age_days=0)
         self.assertEqual(self.db.execute("SELECT count(*) FROM closed_poll_results").fetchone()[0], 0)
 
+    def test_http_failure_logs_full_reason_context_headers_and_redacts_tokens(self):
+        import io
+        import json
+        import urllib.error
+        response = {"ok": False, "error_code": 400, "description": "Bad Request: SECRET",
+                    "parameters": {"retry_after": 31},
+                    "debug": "https://api.telegram.org/botOTHER-CREDENTIAL/stopPoll"}
+        error = urllib.error.HTTPError(
+            "https://api.telegram.org/botSECRET/stopPoll", 400, "Bad Request",
+            {"X-Request-ID": "trace-42", "Date": "today"},
+            io.BytesIO(json.dumps(response).encode()))
+        with patch.object(bot, "TOKEN", "SECRET"), patch.object(bot, "api", side_effect=error), \
+             self.assertLogs(level="ERROR") as logs:
+            with self.assertRaises(bot.TelegramAPIError):
+                bot.tg("stopPoll", {"chat_id": -123, "message_id": 90,
+                                    "unrelated_private_field": "DO-NOT-LOG-ME"})
+        text = "\n".join(logs.output)
+        for expected in ("event=telegram_request_failed", "request_id=", "method=stopPoll",
+                         '"message_id": 90', "http_status=400", "error_code=400",
+                         "retry_after=31", "will_retry=False", "trace-42",
+                         "response=", "[redacted]"):
+            self.assertIn(expected, text)
+        for secret in ("SECRET", "OTHER-CREDENTIAL", "DO-NOT-LOG-ME"):
+            self.assertNotIn(secret, text)
+
+    def test_network_failure_logs_reason_without_leaking_token_in_traceback(self):
+        import traceback
+        import urllib.error
+        error = urllib.error.URLError("connection failed https://api.telegram.org/botSECRET/sendPoll")
+        with patch.object(bot, "TOKEN", "SECRET"), patch.object(bot, "api", side_effect=error), \
+             self.assertLogs(level="ERROR") as logs:
+            try:
+                bot.tg("sendPoll", {"chat_id": -123})
+                self.fail("Expected a transport error")
+            except bot.TelegramTransportError as exc:
+                trace = "".join(traceback.format_exception(exc))
+        text = "\n".join(logs.output)
+        self.assertIn("event=telegram_transport_failed", text)
+        self.assertIn("connection failed", text)
+        self.assertIn("outcome=unknown", text)
+        self.assertNotIn("SECRET", text + trace)
+        self.assertIn("[redacted]", trace)
+
+    def test_retry_and_success_logs_share_request_correlation_id(self):
+        import re
+        response = {"ok": False, "error_code": 429, "description": "rate limited",
+                    "parameters": {"retry_after": 2}}
+        with patch.object(bot, "telegram", side_effect=[response, {"ok": True, "result": True}]), \
+             patch.object(bot.time, "sleep"), self.assertLogs(level="INFO") as logs:
+            self.assertTrue(bot.tg("stopPoll", {"chat_id": -123, "message_id": 90}))
+        text = "\n".join(logs.output)
+        ids = re.findall(r"request_id=([a-f0-9]+)", text)
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(ids[0], ids[1])
+        self.assertIn("retry_in=3", text)
+        self.assertIn("event=telegram_request_succeeded", text)
+        self.assertIn("attempt=2", text)
+
+    def test_non_json_failure_logs_sanitized_response_body(self):
+        import io
+        import urllib.error
+        error = urllib.error.HTTPError("https://example.invalid", 502, "Bad Gateway",
+                                       {}, io.BytesIO(b"<html>upstream failed SECRET</html>"))
+        with patch.object(bot, "TOKEN", "SECRET"), patch.object(bot, "api", side_effect=error), \
+             self.assertLogs(level="ERROR") as logs:
+            with self.assertRaises(bot.TelegramAPIError):
+                bot.tg("stopPoll", {"message_id": 90})
+        text = "\n".join(logs.output)
+        self.assertIn("http_status=502", text)
+        self.assertIn("upstream failed [redacted]", text)
+        self.assertNotIn("SECRET", text)
+
     def test_cover_url_is_strict(self):
         self.assertEqual(
             covers.poster_url({"image_path": "https://image.tmdb.org/t/p/w500/abc.jpg"}),
